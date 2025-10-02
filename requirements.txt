@@ -1,0 +1,17 @@
+fastapi==0.117.1
+uvicorn[standard]==0.36.0
+telethon==1.41.2
+aiohttp==3.9.0
+websockets==12.0
+python-multipart==0.0.6
+sqlalchemy
+psycopg2-binary
+jinja2
+pyrogram
+tgcrypto
+httpx
+pyjwt
+cryptography
+python-dateutil
+ntplib==0.4.0
+requests

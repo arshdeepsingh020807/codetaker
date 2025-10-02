@@ -1,0 +1,544 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stake Auto Claimer - Ultra Fast</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: #16213e;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }
+        .status {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #0f3460;
+            border-radius: 5px;
+        }
+        .status.connected { background: #155724; }
+        .status.disconnected { background: #721c24; }
+        .logs {
+            height: 300px;
+            overflow-y: auto;
+            background: #000;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            margin-bottom: 20px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .claim-btn { background: #28a745; color: white; }
+        .test-btn { background: #007bff; color: white; }
+        .clear-btn { background: #6c757d; color: white; }
+        .speed-indicator {
+            background: #17a2b8;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Stake Auto Claimer - Ultra Fast Mode</h1>
+        
+        <div id="status" class="status disconnected">
+            <span>Status: <span id="connection-status">Disconnected</span></span>
+            <span>Speed: <span class="speed-indicator">INSTANT</span></span>
+            <span>Connections: <span id="connection-count">0</span></span>
+        </div>
+
+        <div class="controls">
+            <button class="claim-btn" onclick="toggleAutoClaim()">
+                <span id="claim-status">Start Auto Claim</span>
+            </button>
+            <button class="test-btn" onclick="sendTestCode()">Send Test Code</button>
+            <button class="clear-btn" onclick="clearLogs()">Clear Logs</button>
+        </div>
+
+        <div id="logs" class="logs"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let isAutoClaimEnabled = false;
+        let reconnectDelay = 100; // Start with 100ms
+
+        // Comprehensive selectors matching userscript
+        const CODE_INPUT_FALLBACK = [
+            'input[name="code"]',
+            'input[name="promo"]',
+            'input[name="bonus"]',
+            'input[name="coupon"]',
+            'input[placeholder*="promo" i]',
+            'input[placeholder*="code" i]',
+            'input[placeholder*="bonus" i]',
+            'input[placeholder*="coupon" i]',
+            'input[id*="promo" i]',
+            'input[id*="code" i]',
+            'input[id*="bonus" i]',
+            '.promo-input',
+            '.bonus-input',
+            '.code-input',
+            '#promo-code',
+            '#bonus-code',
+            '#coupon-code'
+        ];
+
+        const SUBMIT_FALLBACK = [
+            'button[data-testid="password-reset-button"]',
+            'button[type="submit"]',
+            'button:contains("Submit")',
+            'button:contains("Check")',
+            'button:contains("Apply")',
+            'button:contains("Claim")',
+            'button:contains("Redeem")',
+            'button:contains("Activate")',
+            '.submit-btn',
+            '.apply-btn',
+            '.claim-btn',
+            '.redeem-btn',
+            'input[type="submit"]'
+        ];
+
+        const CLAIM_SELECTORS = [
+            'button[data-testid*="claim"]',
+            'button:contains("Claim")',
+            'button:contains("claim")',
+            'button:contains("Claim Bonus")',
+            'button:contains("CLAIM")',
+            'button:contains("bonus")',
+            '.claim-button',
+            '.claim-btn',
+            '.bonus-claim',
+            '.bonus-btn',
+            '.bonus-button',
+            '.stake-button',
+            'button[onclick*="claim"]',
+            'a[href*="claim"]',
+            '.btn-claim',
+            '#claim-btn',
+            '#claimButton',
+            'button[class*="claim"]',
+            'div[role="button"]:contains("Claim")',
+            '*[data-action="claim"]',
+            'button[data-qa*="bonus"]'
+        ];
+
+        const MODAL_SELECTORS = [
+            '.modal',
+            '.popup',
+            '[role="dialog"]',
+            '[role="alertdialog"]',
+            '.ReactModal__Content',
+            '.bonus-modal',
+            '.promo-modal',
+            '.claim-modal',
+            '.MuiDialog-root',
+            '.ant-modal',
+            '.chakra-modal'
+        ];
+
+        const POPUP_SELECTORS = [
+            '.modal',
+            '.popup',
+            '.overlay',
+            '.dialog',
+            '.claim-modal',
+            '.bonus-popup',
+            '[role="dialog"]',
+            '.ReactModal__Content',
+            '.modal-content',
+            '.popup-content'
+        ];
+
+        const SUCCESS_INDICATORS = [
+            '[data-testid*="success"]',
+            '[data-testid*="claimed"]',
+            '.success-message',
+            '.claimed-message',
+            '.bonus-claimed',
+            '.alert-success'
+        ];
+
+        const ERROR_INDICATORS = [
+            '[data-testid*="error"]',
+            '[data-testid*="invalid"]',
+            '.error-message',
+            '.invalid-message',
+            '.alert-error',
+            '.alert-danger'
+        ];
+
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logs = document.getElementById('logs');
+            const logEntry = document.createElement('div');
+            logEntry.style.color = type === 'error' ? '#ff6b6b' : 
+                                 type === 'success' ? '#51cf66' :
+                                 type === 'warning' ? '#ffd43b' : '#74c0fc';
+            logEntry.innerHTML = `[${timestamp}] ${message}`;
+            logs.appendChild(logEntry);
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function connectWebSocket() {
+            const wsUrl = 'wss://tester-px62.onrender.com/ws';
+            
+            // Protect against multiple sockets being opened
+            if (ws && ws.readyState !== WebSocket.CLOSED) {
+                try { ws.close(); } catch (e) {}
+            }
+            
+            log(`🔌 Connecting to ${wsUrl}...`);
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                log('✅ Connected to auto-claimer!', 'success');
+                document.getElementById('connection-status').textContent = 'Connected';
+                document.getElementById('status').className = 'status connected';
+                reconnectDelay = 100; // reset backoff on success
+                
+                // Send ping immediately to establish connection
+                ws.send('ping');
+            };
+            
+            ws.onmessage = function(event) {
+                if (!event.data) return;
+                try {
+                    const data = JSON.parse(event.data);
+                    handleMessage(data);
+                } catch (e) {
+                    log(`⚠️ Non-JSON message: ${event.data}`, 'warning');
+                }
+            };
+            
+            ws.onclose = function() {
+                log('🔌 Connection closed', 'warning');
+                document.getElementById('connection-status').textContent = 'Disconnected';
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('connection-count').textContent = '0';
+                
+                // Retry forever with backoff up to 30s
+                setTimeout(connectWebSocket, reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 2, 30000); // cap at 30s
+                log(`🔄 Reconnecting in ${reconnectDelay}ms...`, 'warning');
+            };
+            
+            ws.onerror = function(error) {
+                log(`❌ WebSocket error: ${error}`, 'error');
+                try { ws.close(); } catch (e) {}
+            };
+        }
+
+        function handleMessage(data) {
+            if (data.type === 'connected') {
+                log(`🚀 Ultra-fast mode activated! Connection ID: ${data.connection_id}`, 'success');
+                if (data.latest_code) {
+                    log(`📋 Latest code available: ${data.latest_code.code}`, 'info');
+                }
+            }
+            
+            if (data.type === 'heartbeat') {
+                document.getElementById('connection-count').textContent = data.active_connections || '0';
+            }
+            
+            if (data.type === 'pong') {
+                // Connection verified
+                log('🏓 Connection verified', 'success');
+            }
+            
+            if (data.type === 'code') {
+                const timeDiff = Date.now() - data.broadcast_ts;
+                log(`🎯 NEW CODE: ${data.code} (${timeDiff}ms latency)`, 'success');
+                
+                if (isAutoClaimEnabled) {
+                    // INSTANT claim with no delay
+                    setTimeout(() => autoClaim(data.code, data.claim_base), 1);
+                }
+            }
+        }
+
+        async function autoClaim(code, claimBase) {
+            log(`⚡ INSTANT CLAIM: ${code}`, 'success');
+            
+            try {
+                // Open claim URL instantly
+                const claimUrl = `${claimBase}/${code}`;
+                const claimWindow = window.open(claimUrl, '_blank');
+                
+                if (!claimWindow) {
+                    log(`❌ Popup blocked for ${code}`, 'error');
+                    return;
+                }
+                
+                // Fire postMessage fallback right away (parallel to DOM scan)
+                try {
+                    claimWindow.postMessage({
+                        action: 'autoclaim',
+                        code: code,
+                        selectors: CLAIM_SELECTORS
+                    }, '*');
+                    log(`📡 Sent fallback postMessage for ${code}`, 'info');
+                } catch (e) {
+                    log(`⚠️ Could not send postMessage fallback: ${e.message}`, 'warning');
+                }
+                
+                // Super fast claim automation with redundancy layers
+                setTimeout(() => {
+                    try {
+                        // Try to access the opened window (will fail due to CORS for different domains)
+                        const doc = claimWindow.document;
+                        
+                        // If we get here, same-origin - proceed with direct DOM access
+                        log(`🔓 Same-origin access granted for ${code}`, 'info');
+                        
+                        // Consolidated single retry loop with timeout
+                        const consolidatedClaimLoop = (document, maxTimeout = 12000) => {
+                            const startTime = Date.now();
+                            let claimed = false;
+                            
+                            const claimInterval = setInterval(() => {
+                                const elapsed = Date.now() - startTime;
+                                
+                                if (elapsed > maxTimeout || claimed) {
+                                    clearInterval(claimInterval);
+                                    return;
+                                }
+                                
+                                try {
+                                    // Check all buttons for claim text using queryContains helper
+                                    const claimButtons = queryContains('button', 'claim', document);
+                                    const bonusButtons = queryContains('button', 'bonus', document);
+                                    const allClaimButtons = [...claimButtons, ...bonusButtons];
+                                    
+                                    for (const button of allClaimButtons) {
+                                        try {
+                                            button.click();
+                                            log(`✅ CLAIMED: ${code} (text-based)`, 'success');
+                                            claimed = true;
+                                            clearInterval(claimInterval);
+                                            return;
+                                        } catch (e) {
+                                            continue;
+                                        }
+                                    }
+                                    
+                                    // Fallback: check selector-based buttons
+                                    for (const selector of CLAIM_SELECTORS) {
+                                        const buttons = document.querySelectorAll(selector);
+                                        for (const button of buttons) {
+                                            try {
+                                                button.click();
+                                                log(`✅ CLAIMED: ${code} (selector: ${selector})`, 'success');
+                                                claimed = true;
+                                                clearInterval(claimInterval);
+                                                return;
+                                            } catch (e) {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Check modals and popups for claim buttons
+                                    const allModalSelectors = [...MODAL_SELECTORS, ...POPUP_SELECTORS];
+                                    for (const modalSelector of allModalSelectors) {
+                                        const modals = document.querySelectorAll(modalSelector);
+                                        for (const modal of modals) {
+                                            if (modal.style.display !== 'none' && modal.offsetParent !== null) {
+                                                // Use queryContains for text-based searching in modals
+                                                const claimButtons = queryContains('button', 'claim', modal);
+                                                const bonusButtons = queryContains('button', 'bonus', modal);
+                                                const collectButtons = queryContains('button', 'collect', modal);
+                                                const allModalButtons = [...claimButtons, ...bonusButtons, ...collectButtons];
+                                                
+                                                for (const claimBtn of allModalButtons) {
+                                                    try {
+                                                        claimBtn.click();
+                                                        log(`🎉 MODAL/POPUP CLAIMED: ${code} (text-based)`, 'success');
+                                                        claimed = true;
+                                                        clearInterval(claimInterval);
+                                                        return;
+                                                    } catch (e) {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e) {
+                                    // Continue trying
+                                }
+                            }, 100); // Check every 100ms
+                        };
+                        
+                        // Start the consolidated claim loop
+                        consolidatedClaimLoop(doc, 12000);
+                        
+                        // Close window after timeout
+                        setTimeout(() => {
+                            try {
+                                claimWindow.close();
+                            } catch (e) {
+                                // Window might already be closed
+                            }
+                        }, 12000);
+                        
+                    } catch (e) {
+                        // Cross-origin restrictions - enhanced fallback strategy
+                        log(`🚨 Cross-origin detected for ${code}: ${e.message}`, 'warning');
+                        log(`⚡ Using enhanced fallback strategy`, 'info');
+                        
+                        // Multiple postMessage attempts with different strategies
+                        const fallbackStrategies = [
+                            // Strategy 1: Basic autoclaim message
+                            { action: 'autoclaim', code: code, selectors: CLAIM_SELECTORS },
+                            // Strategy 2: Simple click instruction
+                            { action: 'clickClaim', code: code },
+                            // Strategy 3: Generic claim trigger
+                            { action: 'triggerClaim', bonus_code: code }
+                        ];
+                        
+                        fallbackStrategies.forEach((strategy, index) => {
+                            setTimeout(() => {
+                                try {
+                                    claimWindow.postMessage(strategy, '*');
+                                    log(`📡 Sent fallback strategy ${index + 1} for ${code}`, 'debug');
+                                } catch (msgError) {
+                                    log(`❌ PostMessage strategy ${index + 1} failed: ${msgError.message}`, 'warning');
+                                }
+                            }, index * 500); // Stagger the attempts
+                        });
+                        
+                        // Give more time for cross-origin attempts
+                        setTimeout(() => {
+                            try {
+                                claimWindow.close();
+                                log(`🔒 Closed cross-origin window for ${code}`, 'debug');
+                            } catch (closeError) {
+                                // Window might already be closed
+                            }
+                        }, 5000);
+                    }
+                }, 50); // 50ms delay to let page start loading
+                
+            } catch (error) {
+                log(`❌ Claim failed for ${code}: ${error.message}`, 'error');
+            }
+        }
+
+        function toggleAutoClaim() {
+            isAutoClaimEnabled = !isAutoClaimEnabled;
+            const button = document.getElementById('claim-status');
+            
+            if (isAutoClaimEnabled) {
+                button.textContent = 'Auto Claim: ON';
+                button.parentElement.style.background = '#dc3545';
+                log('🚀 Auto-claim ENABLED - Ultra fast mode!', 'success');
+            } else {
+                button.textContent = 'Start Auto Claim';
+                button.parentElement.style.background = '#28a745';
+                log('⏸️ Auto-claim DISABLED', 'warning');
+            }
+        }
+
+        function sendTestCode() {
+            const testCode = 'TEST' + Math.random().toString(36).substr(2, 6).toUpperCase();
+            fetch('/send-test-code/' + testCode)
+                .then(response => response.json())
+                .then(data => {
+                    log(`🧪 Test code sent: ${testCode}`, 'info');
+                })
+                .catch(error => {
+                    log(`❌ Failed to send test code: ${error.message}`, 'error');
+                });
+        }
+
+        function clearLogs() {
+            document.getElementById('logs').innerHTML = '';
+        }
+
+        // Custom helper function to replace :contains selector
+        function queryContains(baseSelector, text) {
+            return Array.from(document.querySelectorAll(baseSelector))
+                        .filter(el => el.textContent.toLowerCase().includes(text.toLowerCase()));
+        }
+
+        // Process selectors including :contains pseudo-selectors
+        function querySelectorAllEnhanced(selectorList, root = document) {
+            const results = [];
+            
+            for (const selector of selectorList) {
+                try {
+                    if (selector.includes(':contains(')) {
+                        // Parse :contains selector
+                        const match = selector.match(/^([^:]+):contains\("([^"]+)"\)$/);
+                        if (match) {
+                            const [, baseSelector, text] = match;
+                            const elements = queryContains(baseSelector, text);
+                            results.push(...elements);
+                        }
+                    } else {
+                        // Regular selector
+                        const elements = root.querySelectorAll(selector);
+                        results.push(...Array.from(elements));
+                    }
+                } catch (e) {
+                    // Skip invalid selectors
+                    continue;
+                }
+            }
+            
+            // Remove duplicates
+            return [...new Set(results)];
+        }
+
+        function addSelectorSupport() {
+            if (!Element.prototype.matches) {
+                Element.prototype.matches = Element.prototype.msMatchesSelector || Element.prototype.webkitMatchesSelector;
+            }
+        }
+
+        // Initialize
+        addSelectorSupport();
+        connectWebSocket();
+        
+        // Keep connection alive with frequent pings
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 2000);
+
+        log('🚀 Stake Auto Claimer initialized - Ultra Fast Mode ready!', 'success');
+    </script>
+</body>
+</html>
