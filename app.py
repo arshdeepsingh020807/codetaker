@@ -1,6 +1,33 @@
-# app.py (integrated)
-# Uses Telethon (Telegram USER) + FastAPI WebSocket server
-# Incorporates the user's code extraction idea (regex) where possible.
+"""
+STAKE ULTRA CLAIMER - Credit/Voucher System Backend
+====================================================
+
+A 24/7 Telegram-integrated backend system for monitoring promo codes and managing 
+credit-based user access with precise financial calculations.
+
+Key Features:
+- Telegram channel monitoring for promo codes using Telethon
+- Real-time code broadcasting via WebSocket/SSE to connected users
+- Credit-based access control with Decimal precision for financial calculations
+- High-performance caching system supporting 300+ concurrent users
+- Escrow system for secure code claiming
+- JWT-based authentication with session management
+- PostgreSQL/Supabase database with connection pooling
+
+Architecture:
+- FastAPI web framework with async/await
+- SQLAlchemy ORM for database operations
+- WebSocket manager for real-time client connections
+- Background workers for cache refresh and claim processing
+- Keep-alive system for 24/7 uptime on Render free tier
+
+Performance Optimizations:
+- Single-flight cache locks to prevent thundering herd
+- Per-voucher locks to prevent double-spending
+- Bounded claim queue with backpressure handling
+- Database connection pooling (30 base + 30 overflow connections)
+"""
+
 import os, re, asyncio, random, string, json, time, httpx, threading
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
@@ -18,11 +45,12 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from telethon import TelegramClient, events, functions
 from telethon.errors import SessionPasswordNeededError
 from keepalive import KeepAliveService
-# ⬇️ add:
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, UniqueConstraint, text , Numeric
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
-# ========== PERFORMANCE OPTIMIZATION: Global Caches and Constants ==========
+# ========================================
+# PERFORMANCE & CACHING
+# ========================================
 # Global caches for performance optimization
 voucher_cache = {}
 user_credit_cache = {}
@@ -40,14 +68,14 @@ VOUCHER_CACHE_TTL = 300  # 5 minutes
 USER_CREDIT_CACHE_TTL = 60  # 1 minute
 CLAIM_CACHE_TTL = 3600  # 1 hour
 
-# CRITICAL FIX: Single-flight locks to prevent thundering herd on cache refresh
+# Single-flight locks to prevent thundering herd on cache refresh
 voucher_cache_refresh_lock = asyncio.Lock()
 credit_cache_refresh_lock = asyncio.Lock()
 
-# CRITICAL FIX: Per-voucher locks to prevent double-spending with 500 concurrent users
+# Per-voucher locks to prevent double-spending with 500 concurrent users
 voucher_redemption_locks = {}  # voucher_code -> asyncio.Lock()
 
-# Claim processing queue - OPTIMIZED: Bounded with backpressure for 1000 users
+# Claim processing queue (bounded with backpressure for 1000 users)
 claim_queue = deque(maxlen=20000)  # Max 20K claims prevents unbounded memory growth
 claim_queue_overflow_count = 0  # Track dropped claims for monitoring
 processing_lock = asyncio.Lock()
@@ -57,7 +85,7 @@ processing_active = False
 cache_refresh_worker = None
 claim_queue_worker = None
 cache_cleanup_worker = None
-# ========== END PERFORMANCE OPTIMIZATION SECTION ==========
+
 
 PORT = int(os.getenv("PORT", "5000"))
 TG_API_ID = int(os.getenv("TG_API_ID", "0") or "0")
@@ -78,7 +106,7 @@ if not ADMIN_PASSWORD:
     raise RuntimeError("ADMIN_PASSWORD environment variable is required for security")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
-# SECURITY: Proper session store with user identity tracking
+# Proper session store with user identity tracking
 session_store: Dict[str, dict] = {}  # session_token -> {username, expires_at, csrf_nonces, last_seen}
 
 # Enhanced regex patterns for different code formats
@@ -106,17 +134,16 @@ CLAIM_URL_BASE = os.getenv("CLAIM_URL_BASE", "https://kciade.online")
 RING_SIZE = int(os.getenv("RING_SIZE", "100"))
 
 # Keep-alive configuration
-# DISABLED: Test render URL (production mode) 
-# VPS Production URL
 PRODUCTION_URL = os.getenv("PRODUCTION_URL", "https://kciade.online")
 KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "5"))  # minutes
 
-# ⬇️ Enhanced Database Connection with Auto-Management:
+
+# Database Configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 Base = declarative_base()
 
-# OPTIMIZED: Pool sizing for Supabase Pro $25 plan (200 pooler connections)
+# Pool sizing for Supabase Pro $25 plan (200 pooler connections)
 # For 1000 concurrent users with batching - conservative 30% utilization
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "30"))       # 30 base connections
 MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "30"))   # 30 overflow = 60 total (30% of 200 pooler limit - very safe)
@@ -125,10 +152,10 @@ def create_db_engine():
     """Create optimized SQLAlchemy engine for Supabase Pro"""
     connect_args = {}
 
-    # DEPLOYMENT FIX: Guard against missing DATABASE_URL (optional for development)
+    # Guard against missing DATABASE_URL (optional for development)
     db_url = DATABASE_URL or "sqlite:///./test.db"
     if not DATABASE_URL:
-        print("⚠️ Warning: DATABASE_URL not set - using SQLite fallback for development")
+        print("Warning: DATABASE_URL not set - using SQLite fallback for development")
 
     # Configure based on database type
     if db_url.startswith("sqlite"):
@@ -160,21 +187,6 @@ def create_db_engine():
         # Fallback for other database types
         return create_engine(db_url, pool_pre_ping=True)
 
-# SINGLE WORKER: recreate_db_engine function no longer needed
-# def recreate_db_engine():
-#     """Recreate SQLAlchemy engine - used by Gunicorn post_fork hook"""
-#     global engine, SessionLocal
-#     try:
-#         # Dispose existing connections (inherited from parent process)
-#         engine.dispose()
-#         print("🔄 Disposed inherited database connections")
-#     except Exception as e:
-#         print(f"⚠️ Could not dispose engine: {e}")
-#     
-#     # Create new engine for this worker process
-#     engine = create_db_engine()
-#     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-#     print(f"✅ Recreated SQLAlchemy engine for worker PID {os.getpid()}")
 
 # Create initial engine
 engine = create_db_engine()
@@ -254,7 +266,7 @@ def format_monetary(value, currency_symbol="$") -> str:
         # Format as string without scientific notation
         return f"{currency_symbol}{formatted_value}"
     except (ValueError, TypeError, InvalidOperation) as e:
-        print(f"⚠️ Error formatting monetary value {value}: {e}")
+        print(f"Warning: Error formatting monetary value {value}: {e}")
         return f"{currency_symbol}0.00000000"
 
 def safe_decimal(value, default_value="0") -> Decimal:
@@ -271,7 +283,7 @@ def safe_decimal(value, default_value="0") -> Decimal:
             return value
         return Decimal(str(value))
     except (ValueError, TypeError, InvalidOperation) as e:
-        print(f"⚠️ Error converting to Decimal {value}: {e}")
+        print(f"Warning: Error converting to Decimal {value}: {e}")
         return Decimal(default_value)
 
 def verify_session(request: Request) -> Optional[str]:
@@ -297,10 +309,10 @@ def verify_session(request: Request) -> Optional[str]:
 
 def require_auth(request: Request):
     if not verify_session(request):
-        # DECOY: Misleading cache error instead of authentication required
+        # Misleading cache error instead of authentication required
         raise HTTPException(status_code=502, detail="Cache server unavailable. Please refresh and try again.")
 
-# SECURITY: Centralized AuthContext for all endpoints (per architect guidance)
+# Centralized AuthContext for all endpoints (per architect guidance)
 async def auth_context(request: Request, user: Optional[str] = None) -> str:
     """
     CRITICAL: Centralized authentication dependency for ALL endpoints
@@ -322,21 +334,21 @@ async def auth_context(request: Request, user: Optional[str] = None) -> str:
             jwt_username = payload.get('username')
             if user and user != jwt_username:
                 raise HTTPException(status_code=403, detail="JWT session user mismatch")
-            print(f"🔐 Authenticated via session JWT: {jwt_username}")
+            print(f"Auth: Authenticated via session JWT: {jwt_username}")
             return jwt_username
         else:
-            print(f"❌ Invalid session JWT: {payload.get('error', 'Unknown error')}")
+            print(f"Invalid session JWT: {payload.get('error', 'Unknown error')}")
 
     # Method 3: Legacy token authentication (X-API-Key header or query param)
     token = request.headers.get('X-API-Key') or request.query_params.get('token')
     if not token:
-        # DECOY: Misleading error to confuse attackers
+        # Misleading error to confuse attackers
         raise HTTPException(status_code=503, detail="Authentication service temporarily unavailable. Please contact support.")
 
     # Validate and extract user from legacy token
     token_user = validate_and_extract_user(token)
     if user and user != token_user:
-        # DECOY: Misleading error instead of revealing user mismatch
+        # Misleading error instead of revealing user mismatch
         raise HTTPException(status_code=429, detail="Too many requests. Rate limit exceeded.")
 
     return token_user
@@ -353,7 +365,7 @@ def validate_and_extract_user(token: str) -> str:
     try:
         parts = token.split(':')
         if len(parts) != 3:
-            # DECOY: Misleading database error instead of token format error
+            # Misleading database error instead of token format error
             raise HTTPException(status_code=500, detail="Database connection timeout. Please try again later.")
 
         token_user, exp_str, provided_sig = parts
@@ -361,7 +373,7 @@ def validate_and_extract_user(token: str) -> str:
         # Check expiry
         expiry = int(exp_str)
         if expiry <= time.time():
-            # DECOY: Misleading maintenance error instead of token expired
+            # Misleading maintenance error instead of token expired
             raise HTTPException(status_code=503, detail="System maintenance in progress. Estimated completion: 30 minutes.")
 
         # Validate HMAC signature
@@ -372,28 +384,28 @@ def validate_and_extract_user(token: str) -> str:
         ).hexdigest()
 
         if not hmac.compare_digest(provided_sig, expected_sig):
-            # DECOY: Misleading network error instead of invalid signature
+            # Misleading network error instead of invalid signature
             raise HTTPException(status_code=502, detail="External service unavailable. Please check your network connection.")
 
         return token_user
 
     except ValueError:
-        # DECOY: Misleading server error instead of token format error
+        # Misleading server error instead of token format error
         raise HTTPException(status_code=500, detail="Configuration error. Please contact system administrator.")
     except Exception:
-        # DECOY: Misleading SSL/TLS error instead of token validation failed
+        # Misleading SSL/TLS error instead of token validation failed
         raise HTTPException(status_code=526, detail="SSL handshake failed. Please ensure secure connection.")
 
 def validate_monitor_token(token: str) -> bool:
-    """Enhanced monitor token validation with HMAC and expiry"""
+    """Monitor token validation with HMAC and expiry"""
     if not MONITOR_AUTH_TOKEN:
-        print("⚠️ MONITOR_AUTH_TOKEN not configured in environment")
+        print("Warning: MONITOR_AUTH_TOKEN not configured in environment")
         return False
 
     try:
         # Support both static token (legacy) and HMAC token (secure)
         if token == MONITOR_AUTH_TOKEN:
-            print("✅ Monitor token validated successfully (static)")
+            print("Monitor token validated successfully (static)")
             return True
 
         # Enhanced HMAC-based validation for secure monitor.js connections
@@ -403,17 +415,17 @@ def validate_monitor_token(token: str) -> bool:
 
             # Verify this is monitor.js
             if not monitor_id.startswith("monitor.js"):
-                print("❌ Invalid monitor ID in token")
+                print("Invalid monitor ID in token")
                 return False
 
             # Check expiry (token valid for 1 hour)
             try:
                 expiry = int(exp_str)
                 if expiry <= time.time():
-                    print("❌ Monitor token expired")
+                    print("Monitor token expired")
                     return False
             except ValueError:
-                print("❌ Invalid expiry in monitor token")
+                print("Invalid expiry in monitor token")
                 return False
 
             # Validate HMAC signature using monitor auth token as secret
@@ -424,17 +436,17 @@ def validate_monitor_token(token: str) -> bool:
             ).hexdigest()
 
             if hmac.compare_digest(provided_sig, expected_sig):
-                print(f"✅ Monitor token validated successfully (HMAC): {monitor_id}")
+                print(f"Monitor token validated successfully (HMAC): {monitor_id}")
                 return True
             else:
-                print("❌ Invalid monitor token signature")
+                print("Invalid monitor token signature")
                 return False
 
-        print("❌ Invalid monitor token format")
+        print("Invalid monitor token format")
         return False
 
     except Exception as e:
-        print(f"❌ Monitor token validation error: {e}")
+        print(f"Monitor token validation error: {e}")
         return False
 
 def generate_monitor_token(monitor_id: str = "monitor.js") -> str:
@@ -453,10 +465,10 @@ def generate_monitor_token(monitor_id: str = "monitor.js") -> str:
     ).hexdigest()
 
     token = f"{monitor_id}:{expiry}:{signature}"
-    print(f"🔑 Generated secure monitor token for {monitor_id} (expires: {datetime.fromtimestamp(expiry)})")
+    print(f"Token: Generated secure monitor token for {monitor_id} (expires: {datetime.fromtimestamp(expiry)})")
     return token
 
-# ========== PERFORMANCE OPTIMIZATION: Cache Functions ==========
+# Cache Management Functions
 async def get_voucher_from_cache(code: str):
     """Get voucher from cache with automatic refresh"""
     current_time = time.time()
@@ -469,11 +481,11 @@ async def get_voucher_from_cache(code: str):
     return voucher_cache.get(code)
 
 async def refresh_voucher_cache():
-    """FIXED: Single-flight voucher cache refresh to prevent thundering herd with 500 users - PRECISION: All monetary values as Decimal"""
+    """Single-flight voucher cache refresh to prevent thundering herd with 500 users - PRECISION: All monetary values as Decimal"""
     async with voucher_cache_refresh_lock:
         # Double-check if cache was already refreshed by another thread
         if voucher_cache and time.time() - voucher_cache.get('last_refresh', 0) < 30:
-            print("🔄 Voucher cache recently refreshed by another thread, skipping")
+            print("Voucher cache recently refreshed by another thread, skipping")
             return
 
         try:
@@ -484,7 +496,7 @@ async def refresh_voucher_cache():
                 new_cache = {}
 
                 for voucher in vouchers:
-                    # PRECISION: Store as Decimal objects to maintain full precision
+                    # Store as Decimal objects to maintain full precision
                     new_cache[voucher.code] = {
                         'id': voucher.id,
                         'value': Decimal(str(voucher.value)),
@@ -499,9 +511,9 @@ async def refresh_voucher_cache():
                 voucher_cache.clear()
                 voucher_cache.update(new_cache)
 
-                print(f"✅ SINGLE-FLIGHT: Refreshed voucher cache: {len(new_cache) - 1} vouchers (Decimal precision)")
+                print(f"SINGLE-FLIGHT: Refreshed voucher cache: {len(new_cache) - 1} vouchers (Decimal precision)")
         except Exception as e:
-            print(f"❌ Failed to refresh voucher cache: {e}")
+            print(f"Failed to refresh voucher cache: {e}")
 
 def get_user_credit_from_cache(username: str):
     """Get user credits from cache with automatic refresh"""
@@ -516,30 +528,30 @@ def get_user_credit_from_cache(username: str):
     return user_credit_cache.get(username)
 
 async def refresh_user_credit_cache(username: str):
-    """FIXED: Single-flight user credit cache refresh to prevent thundering herd with 500 users - PRECISION: All monetary values as Decimal"""
+    """Single-flight user credit cache refresh to prevent thundering herd with 500 users - PRECISION: All monetary values as Decimal"""
     async with credit_cache_refresh_lock:
         # Double-check if cache was already refreshed by another thread
         current_time = time.time()
         if (username in user_credit_cache and 
             username in credit_cache_last_update and 
             current_time - credit_cache_last_update[username] < 30):
-            print(f"🔄 Credit cache for {username} recently refreshed by another thread, skipping")
+            print(f"Credit cache for {username} recently refreshed by another thread, skipping")
             return
 
         try:
             with SessionLocal() as db:
                 user = db.query(User).filter(User.username == username).first()
                 if user:
-                    # PRECISION: Store as Decimal objects to maintain full precision
+                    # Store as Decimal objects to maintain full precision
                     user_credit_cache[username] = {
                         'credits': Decimal(str(user.credits)),
                         'reserved_credits': Decimal(str(user.reserved_credits)),
                         'expires': time.time() + USER_CREDIT_CACHE_TTL
                     }
                     credit_cache_last_update[username] = current_time
-                    print(f"✅ SINGLE-FLIGHT: Refreshed credit cache for {username} (Decimal precision)")
+                    print(f"SINGLE-FLIGHT: Refreshed credit cache for {username} (Decimal precision)")
         except Exception as e:
-            print(f"❌ Failed to refresh credit cache for {username}: {e}")
+            print(f"Failed to refresh credit cache for {username}: {e}")
 
 async def get_user_credits(username: str):
     """Get user credits with async cache refresh"""
@@ -561,7 +573,7 @@ async def get_user_credits(username: str):
             'expires': time.time() + USER_CREDIT_CACHE_TTL
         }
 
-# ========== PERFORMANCE OPTIMIZATION: Claim Queue System ==========
+# Claim Processing Queue System
 async def add_claim_to_queue(username: str, code: str, amount: float, currency: str, success: bool):
     """
     CRITICAL: Add claim to queue with backpressure for financial safety
@@ -597,7 +609,7 @@ async def add_claim_to_queue(username: str, code: str, amount: float, currency: 
     
     # Log warning if queue is getting full (70%+)
     if current_size >= int(max_size * 0.7):
-        print(f"⚠️ HIGH LOAD WARNING: Queue at {current_size}/{max_size} ({int(current_size/max_size*100)}% full)")
+        print(f"Warning: HIGH LOAD WARNING: Queue at {current_size}/{max_size} ({int(current_size/max_size*100)}% full)")
 
     # Start processing if not already active
     if not processing_active:
@@ -619,7 +631,7 @@ async def process_claim_queue():
             queue_size = len(claim_queue)
             
             if queue_size > 500:
-                print(f"⚠️ HIGH LOAD: Queue size {queue_size}, using batch size {batch_size}")
+                print(f"Warning: HIGH LOAD: Queue size {queue_size}, using batch size {batch_size}")
             
             # Collect batch of claims (dynamic size or wait 1 second)
             batch = []
@@ -637,7 +649,7 @@ async def process_claim_queue():
                     record_circuit_breaker_success()  # Record successful batch
                 except Exception as e:
                     record_circuit_breaker_failure()  # Record failure
-                    print(f"❌ Batch processing failed: {e}")
+                    print(f"Batch processing failed: {e}")
     finally:
         processing_active = False
 
@@ -658,11 +670,11 @@ async def process_claim_batch(batch: list):
                     code_groups[claim['code']] = []
                 code_groups[claim['code']].append(claim)
 
-            print(f"🚀 BATCH PROCESSING: {len(batch)} claims grouped into {len(code_groups)} codes")
+            print(f"BATCH PROCESSING: {len(batch)} claims grouped into {len(code_groups)} codes")
 
             # Process each code group with per-voucher locking
             for code, claims in code_groups.items():
-                # CRITICAL FIX: Per-voucher locking to prevent race conditions
+                # Per-voucher locking to prevent race conditions
                 if code not in voucher_redemption_locks:
                     voucher_redemption_locks[code] = asyncio.Lock()
                 
@@ -674,7 +686,7 @@ async def process_claim_batch(batch: list):
                     
                     print(f"🎯 Processing {len(successful_claims)} successful claims for code {code}")
                     
-                    # CRITICAL FIX: Aggregate fees per username (handle duplicate claims)
+                    # Aggregate fees per username (handle duplicate claims)
                     user_fee_map = {}  # username -> total_fee
                     
                     for claim in successful_claims:
@@ -699,12 +711,12 @@ async def process_claim_batch(batch: list):
                             user_fee_map[username] = fee_amount
                     
                     if not user_fee_map:
-                        print(f"⚠️ No valid users to process for code {code}")
+                        print(f"Warning: No valid users to process for code {code}")
                         continue
                     
                     print(f"💰 Processing {len(user_fee_map)} users with aggregated fees")
                     
-                    # CRITICAL FIX: Use VALUES table join for per-user fee deductions
+                    # Use VALUES table join for per-user fee deductions
                     # This ensures each user is charged their exact fee amount
                     if DATABASE_URL and DATABASE_URL.startswith("postgresql"):
                         # PostgreSQL: Use VALUES table join for per-user fees
@@ -717,7 +729,7 @@ async def process_claim_batch(batch: list):
                         
                         values_clause = ", ".join(values_list)
                         
-                        # CRITICAL FIX: Can't reference VALUES alias in RETURNING
+                        # Can't reference VALUES alias in RETURNING
                         # Map fees by username in Python instead
                         result = db.execute(text(f"""
                             UPDATE users u 
@@ -748,7 +760,7 @@ async def process_claim_batch(batch: list):
                     
                     successful_usernames = {row[1] for row in updated_users}
                     
-                    print(f"✅ BATCH UPDATE: {len(updated_users)}/{len(user_fee_map)} users updated with individual fees")
+                    print(f"BATCH UPDATE: {len(updated_users)}/{len(user_fee_map)} users updated with individual fees")
                     
                     # Create transaction records for successful deductions
                     for user_id, username, new_reserved in updated_users:
@@ -780,14 +792,14 @@ async def process_claim_batch(batch: list):
                             'currency': 'usd'
                         })
                         
-                        print(f"✅ {username}: -{format_monetary(deducted_fee)} (reserved: {format_monetary(new_reserved)})")
+                        print(f"{username}: -{format_monetary(deducted_fee)} (reserved: {format_monetary(new_reserved)})")
                     
                     # Log failed users (insufficient credits)
                     failed_usernames = set(user_fee_map.keys()) - successful_usernames
                     if failed_usernames:
-                        print(f"❌ INSUFFICIENT CREDITS: {len(failed_usernames)} users skipped - {list(failed_usernames)[:5]}")
+                        print(f"INSUFFICIENT CREDITS: {len(failed_usernames)} users skipped - {list(failed_usernames)[:5]}")
 
-            print(f"✅ BATCH COMMITTED: All {len(batch)} claims processed in single transaction")
+            print(f"BATCH COMMITTED: All {len(batch)} claims processed in single transaction")
 
 async def update_databases_atomic(username: str, code: str, fee_amount: Decimal):
     """FIXED: Atomic database updates with proper validation and rollback"""
@@ -809,7 +821,7 @@ async def update_databases_atomic(username: str, code: str, fee_amount: Decimal)
             user_result = result.fetchone()
             if not user_result:
                 db.rollback()
-                print(f"❌ ATOMIC FAIL: {username} insufficient credits for {format_monetary(fee_amount)}")
+                print(f"ATOMIC FAIL: {username} insufficient credits for {format_monetary(fee_amount)}")
                 return False
 
             user_id, new_credits = user_result
@@ -828,7 +840,7 @@ async def update_databases_atomic(username: str, code: str, fee_amount: Decimal)
             voucher_result = result.fetchone()
             if not voucher_result:
                 db.rollback()
-                print(f"❌ ATOMIC FAIL: Voucher {code} insufficient value for {format_monetary(fee_amount)}")
+                print(f"ATOMIC FAIL: Voucher {code} insufficient value for {format_monetary(fee_amount)}")
                 return False
 
             new_remaining_value = voucher_result[0]
@@ -857,7 +869,7 @@ async def update_databases_atomic(username: str, code: str, fee_amount: Decimal)
 
             db.commit()
 
-            # FIXED: Only update cache AFTER successful DB commit
+            # Only update cache AFTER successful DB commit
             user_credit_cache[username] = {
                 'credits': new_credits,
                 'reserved_credits': 0.0,
@@ -867,11 +879,11 @@ async def update_databases_atomic(username: str, code: str, fee_amount: Decimal)
             if code in voucher_cache:
                 voucher_cache[code]['remaining_value'] = new_remaining_value
 
-            print(f"✅ ATOMIC SUCCESS: {username} -{format_monetary(fee_amount)}, voucher {code} remaining: {format_monetary(new_remaining_value)}")
+            print(f"ATOMIC SUCCESS: {username} -{format_monetary(fee_amount)}, voucher {code} remaining: {format_monetary(new_remaining_value)}")
             return True
 
     except Exception as e:
-        print(f"❌ ATOMIC DB update failed: {e}")
+        print(f"ATOMIC DB update failed: {e}")
         return False
 
 async def update_voucher_atomic(username: str, voucher_code: str, redeem_amount: Decimal):
@@ -899,11 +911,11 @@ async def update_voucher_atomic(username: str, voucher_code: str, redeem_amount:
             # STEP 2: Get or create user
             user = db.query(User).filter(User.username == username).first()
             if not user:
-                # CRITICAL FIX: Give new users $0.5 starter credits (consistent with _get_or_create_user)
+                # Give new users $0.5 starter credits (consistent with _get_or_create_user)
                 user = User(username=username, credits=Decimal('0.5'), reserved_credits=Decimal('0'))
                 db.add(user)
                 db.flush()  # Get user ID
-                print(f"👤 New user '{username}' created with $0.5 starter credits (voucher redemption)")
+                print(f"User: New user '{username}' created with $0.5 starter credits (voucher redemption)")
 
             # STEP 3: ATOMIC voucher update with conditional check
             result = db.execute(text("""
@@ -919,13 +931,13 @@ async def update_voucher_atomic(username: str, voucher_code: str, redeem_amount:
             voucher_result = result.fetchone()
             if not voucher_result:
                 db.rollback()
-                print(f"❌ VOUCHER ATOMIC FAIL: Insufficient balance in voucher {voucher_code} for {format_monetary(redeem_amount)}")
+                print(f"VOUCHER ATOMIC FAIL: Insufficient balance in voucher {voucher_code} for {format_monetary(redeem_amount)}")
                 return (False, "insufficient_balance")
 
             voucher_id, new_remaining_value, voucher_value = voucher_result
 
             # STEP 4: Add redemption amount to user reserved_credits (since user is connected)
-            # CRITICAL FIX: Add to reserved_credits so it's immediately available for fee deductions
+            # Add to reserved_credits so it's immediately available for fee deductions
             db.execute(text("""
                 UPDATE users 
                 SET reserved_credits = reserved_credits + :redeem_amount 
@@ -947,11 +959,11 @@ async def update_voucher_atomic(username: str, voucher_code: str, redeem_amount:
             # STEP 6: Commit all changes atomically
             db.commit()
 
-            print(f"✅ VOUCHER ATOMIC SUCCESS: {username} redeemed {format_monetary(redeem_amount)} from {voucher_code}, remaining: {format_monetary(new_remaining_value)}")
+            print(f"VOUCHER ATOMIC SUCCESS: {username} redeemed {format_monetary(redeem_amount)} from {voucher_code}, remaining: {format_monetary(new_remaining_value)}")
             return (True, "success")
 
     except Exception as e:
-        print(f"❌ VOUCHER ATOMIC UPDATE FAILED: {e}")
+        print(f"VOUCHER ATOMIC UPDATE FAILED: {e}")
         if 'db' in locals():
             db.rollback()
         return False
@@ -970,13 +982,13 @@ async def sync_caches_after_redemption(username: str, voucher_code: str):
         # Refresh the specific voucher from database
         await get_voucher_from_cache(voucher_code)
 
-        print(f"✅ CACHE SYNC: Updated caches for user {username} and voucher {voucher_code}")
+        print(f"CACHE SYNC: Updated caches for user {username} and voucher {voucher_code}")
 
     except Exception as e:
-        print(f"⚠️ Cache sync warning for {username}, voucher {voucher_code}: {e}")
+        print(f"Warning: Cache sync warning for {username}, voucher {voucher_code}: {e}")
         # Don't fail the redemption if cache sync fails
 
-# ========== CLAIM ATTEMPT TRACKING AND ANTI-FRAUD ==========
+# Claim Attempt Tracking & Anti-Fraud
 async def check_claim_attempts(username: str, code: str) -> bool:
     """FIXED: Anti-fraud rate limiting with claim attempt cache"""
     current_time = time.time()
@@ -1037,7 +1049,7 @@ async def record_successful_claim(username: str, code: str):
             'reset_time': time.time()
         }
 
-# ========== BACKGROUND WORKER FUNCTIONS ==========
+# Background Worker Functions
 async def background_queue_processor():
     """Background worker to process claim queue periodically"""
     while True:
@@ -1046,7 +1058,7 @@ async def background_queue_processor():
                 await process_claim_queue()
             await asyncio.sleep(5)  # Check every 5 seconds
         except Exception as e:
-            print(f"❌ Background queue processor error: {e}")
+            print(f"Background queue processor error: {e}")
             await asyncio.sleep(10)  # Wait longer on error
 
 async def background_cache_refresher():
@@ -1064,7 +1076,7 @@ async def background_cache_refresher():
 
             await asyncio.sleep(300)  # Refresh every 5 minutes
         except Exception as e:
-            print(f"❌ Background cache refresher error: {e}")
+            print(f"Background cache refresher error: {e}")
             await asyncio.sleep(60)  # Wait longer on error
 
 async def background_cache_cleaner():
@@ -1083,7 +1095,7 @@ async def background_cache_cleaner():
             for code in expired_vouchers:
                 del voucher_cache[code]
 
-            # OPTIMIZED: Clean disconnected user caches (not in SSE connections for 5+ minutes)
+            # Clean disconnected user caches (not in SSE connections for 5+ minutes)
             disconnected_users = []
             for username in list(user_credit_cache.keys()):
                 # Check if user is NOT connected to SSE
@@ -1099,7 +1111,7 @@ async def background_cache_cleaner():
                     del user_credit_cache[username]
                 if username in credit_cache_last_update:
                     del credit_cache_last_update[username]
-                # CRITICAL FIX: Also delete credit_cache (not just credit_cache_last_update)
+                # Also delete credit_cache (not just credit_cache_last_update)
                 if username in credit_cache:
                     del credit_cache[username]
                 # Also clean persistent auth cache
@@ -1120,19 +1132,19 @@ async def background_cache_cleaner():
             if expired_vouchers or disconnected_users or expired_attempts:
                 print(f"🧹 Cache cleanup: {len(expired_vouchers)} vouchers, {len(disconnected_users)} disconnected users, {len(expired_attempts)} attempts")
 
-            await asyncio.sleep(300)  # OPTIMIZED: Clean every 5 minutes (was 30min) for 1000 users
+            await asyncio.sleep(300)  # Clean every 5 minutes (was 30min) for 1000 users
         except Exception as e:
-            print(f"❌ Background cache cleaner error: {e}")
+            print(f"Background cache cleaner error: {e}")
             await asyncio.sleep(60)  # Wait shorter on error
 
-# ========== END PERFORMANCE OPTIMIZATION SECTION ==========
+
 
 def migrate_database():
     """Complete database migration - PostgreSQL/Supabase compatible with all tables"""
     try:
         from sqlalchemy import text
 
-        # CRITICAL FIX: Ensure all tables are created first
+        # Ensure all tables are created first
         print("🗃️ Ensuring all database tables exist...")
         Base.metadata.create_all(bind=engine)
 
@@ -1152,7 +1164,7 @@ def migrate_database():
                     conn.execute(text("ALTER TABLE vouchers ADD COLUMN remaining_value NUMERIC(20,8);"))
                     conn.execute(text("UPDATE vouchers SET remaining_value = value WHERE remaining_value IS NULL;"))
                     conn.execute(text("ALTER TABLE vouchers ALTER COLUMN remaining_value SET NOT NULL;"))
-                    print("✅ Added remaining_value column to vouchers table")
+                    print("Added remaining_value column to vouchers table")
 
                 # Migration 2: CRITICAL FIX - Actually perform ALTER TABLE for numeric precision
                 financial_tables = [
@@ -1190,18 +1202,18 @@ def migrate_database():
                                     USING {column_name}::NUMERIC(20,8);
                                 """
                                 conn.execute(text(alter_sql))
-                                print(f"✅ Updated {table_name}.{column_name} to NUMERIC(20,8)")
+                                print(f"Updated {table_name}.{column_name} to NUMERIC(20,8)")
                             else:
-                                print(f"✅ {table_name}.{column_name} already has correct NUMERIC(20,8) type")
+                                print(f"{table_name}.{column_name} already has correct NUMERIC(20,8) type")
                         else:
-                            print(f"⚠️ Column {table_name}.{column_name} not found - table may not exist yet")
+                            print(f"Warning: Column {table_name}.{column_name} not found - table may not exist yet")
 
                     except Exception as col_error:
-                        print(f"❌ Failed to update {table_name}.{column_name}: {col_error}")
+                        print(f"Failed to update {table_name}.{column_name}: {col_error}")
                         # Continue with other columns instead of failing completely
 
                 conn.commit()
-                print("✅ PostgreSQL migrations completed")
+                print("PostgreSQL migrations completed")
             else:
                 print("🗃️ Running SQLite migrations...")
                 # SQLite fallback: Use PRAGMA table_info
@@ -1211,15 +1223,15 @@ def migrate_database():
                     conn.execute(text("ALTER TABLE vouchers ADD COLUMN remaining_value FLOAT;"))
                     conn.execute(text("UPDATE vouchers SET remaining_value = value WHERE remaining_value IS NULL;"))
                     conn.commit()
-                    print("✅ Added remaining_value column to vouchers table (SQLite)")
+                    print("Added remaining_value column to vouchers table (SQLite)")
                 else:
-                    print("✅ SQLite migrations completed")
+                    print("SQLite migrations completed")
 
     except Exception as e:
-        print(f"❌ Migration error: {e}")
+        print(f"Migration error: {e}")
         # Don't fail startup on migration errors in production
         if not (DATABASE_URL and "localhost" in DATABASE_URL):
-            print("⚠️ Continuing startup despite migration issues (production mode)")
+            print("Warning: Continuing startup despite migration issues (production mode)")
 
 # Enhanced Database Session Management with Auto-Disconnect
 def get_db():
@@ -1260,7 +1272,7 @@ async def cleanup_idle_connections():
             # Clean up expired pre-authorizations ONLY if user has no active connections
             expired_auths = []
             for username, auth_data in user_authorizations.items():
-                # FIXED: Only cleanup if user has been disconnected for 1+ hours AND has no active SSE connections
+                # Only cleanup if user has been disconnected for 1+ hours AND has no active SSE connections
                 if (current_time - auth_data['connection_time'] > 3600 and 
                     username not in sse_connections):  # No active connections
                     expired_auths.append(username)
@@ -1306,7 +1318,7 @@ class Transaction(Base):
 
     user = relationship("User", back_populates="transactions")
 
-# ===================== BATCH CLAIM PROCESSING TABLES =====================
+# Batch Claim Processing Tables
 # For handling simultaneous claims across multiple users with proper precision
 
 class ClaimBatch(Base):
@@ -1351,8 +1363,8 @@ class ClaimBatchItem(Base):
     batch = relationship("ClaimBatch", back_populates="batch_items")
     user = relationship("User")
 
-# ===================== ADMIN RATES DATABASE TABLE =====================
-# CRITICAL: Store admin-set rates in database for persistence across restarts
+# Admin Rates Table
+# Store admin-set rates in database for persistence across restarts
 
 class AdminRate(Base):
     __tablename__ = "admin_rates"
@@ -1370,7 +1382,7 @@ migrate_database()
 
 # Note: Escrow migration will be called after all classes are defined
 
-# ===================== BATCH CLAIM PROCESSING SYSTEM =====================
+# Batch Claim Processing System
 # Handle simultaneous claims across multiple users with proper concurrency control
 
 async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Session) -> dict:
@@ -1421,14 +1433,14 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
             }
 
         # OPTIMIZATION: Convert USD to USDT using single API call (instead of multiple conversions)
-        print(f"🚀 OPTIMIZATION: Converting ${usd_value} USD to USDT using single API call")
+        print(f"OPTIMIZATION: Converting ${usd_value} USD to USDT using single API call")
         try:
             # Single conversion: Get USDT rate (USD per 1 USDT, should be ~1.0 for stablecoin)
             usdt_rate = await get_crypto_rate_usd('usdt')  # Returns USD per 1 USDT
             usdt_value = usd_value / Decimal(str(usdt_rate))  # Convert: USD amount / (USD per USDT) = USDT amount
             print(f"💱 SINGLE CONVERSION: ${usd_value} USD = {usdt_value} USDT (rate: 1 USDT = ${usdt_rate} USD)")
         except Exception as e:
-            print(f"⚠️ USDT conversion failed: {e}, using USD equivalent")
+            print(f"Warning: USDT conversion failed: {e}, using USD equivalent")
             usdt_value = usd_value  # Fallback to USD if USDT conversion fails
             usdt_rate = 1.0
 
@@ -1445,7 +1457,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
 
         print(f"🎯 BATCH PROCESSING: Starting batch {new_batch.id} for code {code} ({usdt_value} USDT equivalent)")
 
-        # CRITICAL: Only get users who successfully claimed this specific code
+        # Only get users who successfully claimed this specific code
         successful_users = db.execute(text("""
             SELECT DISTINCT username FROM claim_attempts 
             WHERE code = :code AND success = TRUE
@@ -1453,7 +1465,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
 
         # No fallback to all users - only process users who actually claimed this code
         if not successful_users:
-            print(f"⚠️ No users found who successfully claimed code {code} - skipping batch processing")
+            print(f"Warning: No users found who successfully claimed code {code} - skipping batch processing")
             new_batch.status = 'completed'
             new_batch.processed_at = func.now()
             db.commit()
@@ -1466,7 +1478,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
         user_list = [row[0] for row in successful_users]
         print(f"🎯 Found {len(user_list)} users who successfully claimed code {code}")
 
-        # OPTIMIZED: Use single USDT conversion for all users (5% fee)
+        # Use single USDT conversion for all users (5% fee)
         fee_per_user_usdt = usdt_value * Decimal('0.05')  # 5% fee in USDT
 
         print(f"💰 OPTIMIZED BATCH FEE: {fee_per_user_usdt} USDT per user (5% of {usdt_value} USDT)")
@@ -1493,14 +1505,14 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
             user_ids = list(user_id_map.values())
 
             if not user_ids:
-                print(f"⚠️ No valid users found in database")
+                print(f"Warning: No valid users found in database")
                 return {
                     'status': 'failed',
                     'batch_id': new_batch.id,
                     'message': 'No valid users found'
                 }
 
-            print(f"🚀 TRUE BATCH: Deducting ${fee_amount_usdt} from {len(user_ids)} users with SINGLE query")
+            print(f"TRUE BATCH: Deducting ${fee_amount_usdt} from {len(user_ids)} users with SINGLE query")
 
             # Step 2: SINGLE UPDATE query for ALL users (instead of 600 individual queries)
             result = db.execute(
@@ -1518,7 +1530,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
             updated_users = result.fetchall()
             updated_count = len(updated_users)
 
-            print(f"✅ TRUE BATCH: Successfully deducted from {updated_count}/{len(user_ids)} users in ONE query")
+            print(f"TRUE BATCH: Successfully deducted from {updated_count}/{len(user_ids)} users in ONE query")
 
             # Step 4: Create batch items and transaction records for successful users
             for user_id, username in updated_users:
@@ -1538,15 +1550,15 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
                     'username': username
                 })
 
-                print(f"✅ PROCESSED: {username} - ${fee_amount_usdt} USDT fee deducted")
+                print(f"PROCESSED: {username} - ${fee_amount_usdt} USDT fee deducted")
 
             # Log users who didn't have enough credits
             failed_users = set(user_list) - {username for _, username in updated_users}
             if failed_users:
-                print(f"❌ INSUFFICIENT CREDITS: {len(failed_users)} users skipped - {list(failed_users)[:5]}")
+                print(f"INSUFFICIENT CREDITS: {len(failed_users)} users skipped - {list(failed_users)[:5]}")
 
         except Exception as e:
-            print(f"❌ Batch update error: {e}")
+            print(f"Batch update error: {e}")
             db.rollback()
             return {
                 'status': 'failed',
@@ -1576,7 +1588,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
         # Commit all changes atomically
         db.commit()
 
-        print(f"✅ OPTIMIZED BATCH COMPLETED: Processed {len(successful_deductions)} users for code {code} using single USDT conversion")
+        print(f"OPTIMIZED BATCH COMPLETED: Processed {len(successful_deductions)} users for code {code} using single USDT conversion")
 
         return {
             'status': 'completed',
@@ -1585,7 +1597,7 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
         }
 
     except Exception as e:
-        print(f"❌ BATCH ERROR: {e}")
+        print(f"BATCH ERROR: {e}")
         db.rollback()
         return {
             'status': 'failed',
@@ -1646,7 +1658,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
                 'message': f'Batch already processed'
             }
 
-        print(f"🚀 ULTIMATE OPTIMIZATION: Processing code {code}")
+        print(f"ULTIMATE OPTIMIZATION: Processing code {code}")
         print(f"📊 Using raw claim data: {amount} {currency.upper()} from user {triggering_username}")
 
         # STEP 1: Get USDT rate using single API call (the core optimization)
@@ -1661,7 +1673,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
             usdt_value = usd_value / Decimal(str(usdt_rate))  # USD amount / (USD per USDT) = USDT amount
             print(f"🎯 SINGLE CONVERSION RESULT: ${usd_value} USD = {usdt_value} USDT (rate: 1 USDT = ${usdt_rate} USD)")
         except Exception as e:
-            print(f"⚠️ USDT conversion failed: {e}, using USD equivalent")
+            print(f"Warning: USDT conversion failed: {e}, using USD equivalent")
             usd_value = await convert_to_usd(amount, currency)
             usdt_value = usd_value  # Fallback to USD if USDT conversion fails
             usdt_rate = 1.0
@@ -1685,7 +1697,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
 
         # Only process users who actually claimed this code
         if not successful_users:
-            print(f"⚠️ No users found who successfully claimed code {code} - skipping batch processing")
+            print(f"Warning: No users found who successfully claimed code {code} - skipping batch processing")
             new_batch.status = 'completed'
             new_batch.processed_at = func.now()
             db.commit()
@@ -1715,13 +1727,13 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
         successful_batch_items = []
 
         for username in user_list:
-            # CRITICAL FIX: Per-user locking to prevent race conditions and double-deductions
+            # Per-user locking to prevent race conditions and double-deductions
             async with per_user_locks[username]:
                 try:
                     # Get user record
                     user = db.query(User).filter(User.username == username).first()
                     if not user:
-                        print(f"⚠️ User {username} not found, skipping")
+                        print(f"Warning: User {username} not found, skipping")
                         continue
 
                     # SECURITY FIX: Keep as Decimal for precise monetary arithmetic (no float conversion)
@@ -1751,12 +1763,12 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
                             'username': username
                         })
 
-                        print(f"✅ ULTIMATE PROCESSED: {username} - ${fee_amount_usdt} USDT fee deducted successfully")
+                        print(f"ULTIMATE PROCESSED: {username} - ${fee_amount_usdt} USDT fee deducted successfully")
                     else:
-                        print(f"❌ INSUFFICIENT: {username} lacks ${fee_amount_usdt} in reserved credits - skipping")
+                        print(f"INSUFFICIENT: {username} lacks ${fee_amount_usdt} in reserved credits - skipping")
 
                 except Exception as e:
-                    print(f"❌ Error processing user {username}: {e}")
+                    print(f"Error processing user {username}: {e}")
                     db.rollback()
                     return {
                         'status': 'failed',
@@ -1786,7 +1798,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
         # Commit all changes atomically
         db.commit()
 
-        print(f"✅ ULTIMATE OPTIMIZATION COMPLETED: Processed {len(successful_deductions)} users for code {code} using single conversion")
+        print(f"ULTIMATE OPTIMIZATION COMPLETED: Processed {len(successful_deductions)} users for code {code} using single conversion")
         print(f"🎯 Original claim: {amount} {currency.upper()} → {usdt_value} USDT → 5% fee applied to all {len(successful_deductions)} users")
 
         return {
@@ -1796,7 +1808,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
         }
 
     except Exception as e:
-        print(f"❌ OPTIMIZED BATCH ERROR: {e}")
+        print(f"OPTIMIZED BATCH ERROR: {e}")
         db.rollback()
         return {
             'status': 'failed',
@@ -1804,7 +1816,7 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
             'message': f'Optimized batch processing failed: {str(e)}'
         }
 
-# ===================== CURRENCY CONVERSION SYSTEM =====================
+# Currency Conversion System
 # Rate cache with expiry (5 minutes)
 rate_cache = {}
 CACHE_EXPIRY = 300  # 5 minutes in seconds
@@ -1846,7 +1858,7 @@ CRYPTO_MAPPING = {
     'trump': 'official-trump',  # TRUMP token support enabled - Official Trump on Solana
 }
 
-# SECURITY: Startup validation to ensure CRYPTO_MAPPING matches ALLOWED_CURRENCIES
+# Startup validation to ensure CRYPTO_MAPPING matches ALLOWED_CURRENCIES
 assert set(CRYPTO_MAPPING.keys()) == ALLOWED_CURRENCIES, f"CRYPTO_MAPPING mismatch: {set(CRYPTO_MAPPING.keys()) ^ ALLOWED_CURRENCIES}"
 
 async def get_crypto_rate_usd(currency: str) -> float:
@@ -1854,7 +1866,7 @@ async def get_crypto_rate_usd(currency: str) -> float:
     Get the current USD rate for a cryptocurrency using multiple API providers with fallbacks
     Returns rate or uses cached/static fallback if all APIs fail
     """
-    # SECURITY: Centralized validation - fails fast for any unauthorized currency
+    # Centralized validation - fails fast for any unauthorized currency
     currency = validate_currency(currency)
 
     # Handle USDT (should return ~1.0)
@@ -1925,22 +1937,17 @@ async def get_crypto_rate_usd(currency: str) -> float:
     #         'delay': 0.3
     #     }
     # ]
-    # 
     # for provider in api_providers:
     #     try:
     #         # Add delay to respect rate limits
     #         await asyncio.sleep(provider['delay'])
-    #         
     #         async with httpx.AsyncClient(timeout=5.0) as client:
     #             response = await client.get(provider['url'])
-    #             
     #             if response.status_code == 429:  # Rate limited
-    #                 print(f"⚠️ {provider['name']} rate limited, trying next provider...")
+    #                 print(f"Warning: {provider['name']} rate limited, trying next provider...")
     #                 continue
-    #                 
     #             response.raise_for_status()
     #             data = response.json()
-    #             
     #             # Parse response based on provider
     #             if provider['name'] == 'CoinGecko':
     #                 if coin_id in data and 'usd' in data[coin_id]:
@@ -1950,25 +1957,22 @@ async def get_crypto_rate_usd(currency: str) -> float:
     #                     rate = float(data['data']['priceUsd'])
     #             else:
     #                 continue
-    #             
     #             # Cache successful result with extended expiry during high load
     #             rate_cache[cache_key] = {
     #                 'rate': rate,
     #                 'timestamp': now
     #             }
-    #             
     #             print(f"💱 {provider['name']}: 1 {currency.upper()} = ${rate} USD")
     #             return rate
-    #             
     #     except httpx.RequestError as e:
-    #         print(f"⚠️ {provider['name']} failed: {e}")
+    #         print(f"Warning: {provider['name']} failed: {e}")
     #         continue
     #     except Exception as e:
-    #         print(f"⚠️ {provider['name']} error: {e}")
+    #         print(f"Warning: {provider['name']} error: {e}")
     #         continue
 
     # No admin rate set - use fallbacks in order of preference
-    print(f"⚠️ No admin rate set for {currency}, using fallbacks...")
+    print(f"Warning: No admin rate set for {currency}, using fallbacks...")
 
     # 1. Use stale cached data (up to 1 hour old)
     if cache_key in rate_cache:
@@ -1980,7 +1984,7 @@ async def get_crypto_rate_usd(currency: str) -> float:
     # 2. Use static fallback rate for critical currencies
     if currency in FALLBACK_RATES:
         rate = FALLBACK_RATES[currency]
-        print(f"🔄 Using fallback rate: 1 {currency.upper()} = ${rate} USD")
+        print(f"Using fallback rate: 1 {currency.upper()} = ${rate} USD")
 
         # Cache the fallback rate temporarily
         rate_cache[cache_key] = {
@@ -1990,7 +1994,7 @@ async def get_crypto_rate_usd(currency: str) -> float:
         return rate
 
     # 3. Final fallback - assume reasonable value to prevent complete failure
-    print(f"❌ No rate available for {currency}, using emergency fallback")
+    print(f"No rate available for {currency}, using emergency fallback")
     raise ValueError(f"Unable to get exchange rate for {currency} - all providers failed")
 
 async def convert_to_usd(amount: Decimal, currency: str) -> Decimal:
@@ -2012,10 +2016,10 @@ async def convert_to_usd(amount: Decimal, currency: str) -> Decimal:
         return usd_amount
 
     except Exception as e:
-        print(f"❌ Currency conversion failed: {e}")
+        print(f"Currency conversion failed: {e}")
         raise ValueError(f"Failed to convert {amount} {currency} to USD: {str(e)}")
 
-# ===================== ADMIN RATE MANAGEMENT SYSTEM =====================
+# Admin Rate Management
 # ADMIN-CONTROLLED RATES: Store rates set by admin via Telegram bot
 # Rates persist until manually updated by admin
 admin_rates: Dict[str, dict] = {}  # currency -> {rate, updated_at, updated_by} - LEGACY: migrating to database
@@ -2032,9 +2036,9 @@ def load_admin_rates_from_db():
                 'updated_at': db_rate.updated_at.strftime('%Y-%m-%d %H:%M:%S'),
                 'updated_by': db_rate.updated_by
             }
-        print(f"✅ Loaded {len(admin_rates)} admin rates from database")
+        print(f"Loaded {len(admin_rates)} admin rates from database")
     except Exception as e:
-        print(f"⚠️ Could not load admin rates from database: {e}")
+        print(f"Warning: Could not load admin rates from database: {e}")
     finally:
         if db:
             db.close()
@@ -2043,7 +2047,7 @@ def save_admin_rate_to_db(currency: str, rate: float, updated_by: str = 'admin')
     """Save admin rate to database for persistence"""
     db = None
     try:
-        # SECURITY: Enforce currency validation at persistence boundary
+        # Enforce currency validation at persistence boundary
         currency = validate_currency(currency)
 
         db = SessionLocal()
@@ -2070,13 +2074,13 @@ def save_admin_rate_to_db(currency: str, rate: float, updated_by: str = 'admin')
     except Exception as e:
         if db:
             db.rollback()
-        print(f"❌ Failed to save admin rate to database: {e}")
+        print(f"Failed to save admin rate to database: {e}")
         return False
     finally:
         if db:
             db.close()
 
-# ===================== BULLETPROOF CLAIM VERIFICATION SYSTEM =====================
+# Claim Verification System
 # CRITICAL SECURITY: Server is authoritative source of claim data using JWT-signed tickets
 
 # BULLETPROOF: Non-replayable claim tickets for single-use enforcement
@@ -2115,8 +2119,8 @@ class EscrowLock(Base):
         UniqueConstraint('username', 'masked_code', name='uq_user_masked_code'),
     )
 
-# ===================== ENHANCED JWT TOKEN ROTATION SYSTEM =====================
-# SECURITY: Separate secrets for different token types with automatic rotation
+# JWT Token Rotation System
+# Separate secrets for different token types with automatic rotation
 
 # SESSION TOKENS: Long-lived per user session (no more constant reconnections)
 SESSION_TOKEN_EXPIRY = 86400  # 24 hours - stable connection until user disconnects
@@ -2190,9 +2194,9 @@ def migrate_escrow_table():
         # The create_all above should handle this, but let's be explicit
         EscrowLock.__table__.create(engine, checkfirst=True)
         ClaimTicket.__table__.create(engine, checkfirst=True)
-        print("✅ Escrow locks and claim tickets tables ready")
+        print("Escrow locks and claim tickets tables ready")
     except Exception as e:
-        print(f"⚠️ Escrow migration note: {e}")
+        print(f"Warning: Escrow migration note: {e}")
 
 migrate_escrow_table()
 
@@ -2205,7 +2209,7 @@ def startup_reconciliation():
         users_with_reserves = db.query(User).filter(User.reserved_credits > 0).all()
 
         if users_with_reserves:
-            print(f"🔄 STARTUP RECONCILIATION: Found {len(users_with_reserves)} users with reserved credits")
+            print(f"STARTUP RECONCILIATION: Found {len(users_with_reserves)} users with reserved credits")
 
             total_released = Decimal('0.0')
             for user in users_with_reserves:
@@ -2218,17 +2222,17 @@ def startup_reconciliation():
                 )
 
                 total_released += Decimal(str(reserved_amount))
-                print(f"🔄 RELEASED: {user.username} - ${reserved_amount} back to available credits")
+                print(f"RELEASED: {user.username} - ${reserved_amount} back to available credits")
 
             db.commit()
-            print(f"✅ STARTUP RECONCILIATION COMPLETED: Released ${total_released:.2f} total stranded credits")
+            print(f"STARTUP RECONCILIATION COMPLETED: Released ${total_released:.2f} total stranded credits")
         else:
-            print("✅ STARTUP RECONCILIATION: No stranded reserved credits found")
+            print("STARTUP RECONCILIATION: No stranded reserved credits found")
 
         db.close()
 
     except Exception as e:
-        print(f"❌ STARTUP RECONCILIATION FAILED: {e}")
+        print(f"STARTUP RECONCILIATION FAILED: {e}")
         if 'db' in locals():
             db.rollback()
             db.close()
@@ -2252,12 +2256,10 @@ async def verify_claim_with_stake(code: str) -> tuple[bool, dict]:
     if not re.match(r'^[a-zA-Z0-9]{4,25}$', code):
         return False, {"error": "Invalid code format"}
 
-    # DISABLED: Mock Stake API verification (production mode)
-    # Simulate Stake API call (replace with real implementation)
+        # Simulate Stake API call (replace with real implementation)
     # print(f"🔍 VERIFYING with Stake API: {code}")
 
-    # DISABLED: Mock response data (production mode)
-    # For demo purposes, simulate some claim data
+        # For demo purposes, simulate some claim data
     # In production, extract this from actual Stake GraphQL response
     # mock_stake_response = {
     #     "valid": True,
@@ -2273,11 +2275,9 @@ async def verify_claim_with_stake(code: str) -> tuple[bool, dict]:
     #     stake_data = response.json()
     #     if stake_data.get("errors"):
     #         return False, {"error": "Stake API error"}
-    #     
     #     claim_info = stake_data.get("data", {}).get("claimConditionBonusCode")
     #     if not claim_info:
     #         return False, {"error": "Code not found"}
-    #     
     #     return True, {
     #         "amount": claim_info["amount"],
     #         "currency": claim_info["currency"],
@@ -2285,13 +2285,13 @@ async def verify_claim_with_stake(code: str) -> tuple[bool, dict]:
     #         "stake_verified": True
     #     }
 
-    # DECOY: Return misleading error instead of revealing unimplemented features
+    # Return misleading error instead of revealing unimplemented features
     return False, {
         "error": "verification_timeout",
         "message": "Remote verification service is currently overloaded. Please try again in a few minutes."
     }
 
-# ===================== SESSION TOKEN GENERATION =====================
+# Session Token Generation
 
 def generate_session_jwt(username: str, connection_id: str = None) -> str:
     """
@@ -2337,7 +2337,7 @@ def generate_session_jwt(username: str, connection_id: str = None) -> str:
         "connection_id": connection_id or f"{username}_{int(current_time)}"
     }
 
-    print(f"🔑 Created stable 24hr token for {username} - no more reconnections!")
+    print(f"Token: Created stable 24hr token for {username} - no more reconnections!")
     return session_token
 
 def verify_session_jwt(token: str) -> tuple[bool, dict]:
@@ -2421,7 +2421,7 @@ async def sse_heartbeat_loop():
 
 def update_connection_metrics():
     """Update connection metrics for monitoring 300+ concurrent users"""
-    # FIXED: Count actual connections, not just users
+    # Count actual connections, not just users
     connection_metrics['active_connections'] = sum(len(v) for v in sse_connections.values())
     connection_metrics['last_cleanup'] = time.time()
 
@@ -2448,7 +2448,7 @@ def handle_sse_pong(connection_id: str):
     if connection_id in sse_connection_health:
         sse_connection_health[connection_id]['last_pong'] = time.time()
 
-        # FIXED: Update authorization connection time on active pong responses
+        # Update authorization connection time on active pong responses
         username = sse_connection_health[connection_id].get('username')
         if username and username in user_authorizations:
             user_authorizations[username]['connection_time'] = time.time()
@@ -2500,7 +2500,7 @@ def verify_claim_ticket(token: str) -> tuple[bool, dict]:
         if payload.get("type") != "claim_ticket":
             return False, {"error": "Invalid token type"}
 
-        print(f"✅ Valid claim ticket: {payload['code']} = {payload['amount']} {payload['currency']} (2min expiry)")
+        print(f"Valid claim ticket: {payload['code']} = {payload['amount']} {payload['currency']} (2min expiry)")
         return True, payload
 
     except jwt.ExpiredSignatureError:
@@ -2508,7 +2508,7 @@ def verify_claim_ticket(token: str) -> tuple[bool, dict]:
     except jwt.InvalidTokenError:
         return False, {"error": "Invalid claim ticket"}
 
-# ===================== ESCROW SYSTEM FUNCTIONS =====================
+# Escrow System Functions
 
 def create_masked_code(code: str) -> str:
     """Create masked version of code for secure distribution"""
@@ -2681,7 +2681,7 @@ async def cleanup_expired_escrows(db: Session):
 
                 if not result.fetchone():
                     # Already processed by another cleanup process
-                    print(f"⚠️ Escrow {escrow_id} already processed by concurrent cleanup")
+                    print(f"Warning: Escrow {escrow_id} already processed by concurrent cleanup")
                     continue
 
                 # ATOMIC OPERATION: Refund credits to user balance
@@ -2707,16 +2707,16 @@ async def cleanup_expired_escrows(db: Session):
                     print(f"💰 ATOMIC REFUND: ${locked_amount:.4f} → {username} (balance: ${new_balance:.4f}, expired {masked_code})")
                     refund_count += 1
                 else:
-                    print(f"⚠️ User {username} not found for escrow refund {escrow_id}")
+                    print(f"Warning: User {username} not found for escrow refund {escrow_id}")
 
             except Exception as escrow_error:
-                print(f"❌ Failed to process escrow {escrow_id}: {escrow_error}")
+                print(f"Failed to process escrow {escrow_id}: {escrow_error}")
                 db.rollback()
                 raise escrow_error
 
         if refund_count > 0:
             db.commit()
-            print(f"✅ BULLETPROOF: Atomically refunded {refund_count} expired escrows")
+            print(f"BULLETPROOF: Atomically refunded {refund_count} expired escrows")
             # Invalidate credit cache for affected users
             for escrow_row in expired_escrows[:refund_count]:
                 _invalidate_user_credits(escrow_row[1])  # username is at index 1
@@ -2724,7 +2724,7 @@ async def cleanup_expired_escrows(db: Session):
         return refund_count
 
     except Exception as e:
-        print(f"❌ CRITICAL: Escrow cleanup failed: {e}")
+        print(f"CRITICAL: Escrow cleanup failed: {e}")
         db.rollback()
         raise e
 
@@ -2736,9 +2736,9 @@ async def automatic_escrow_cleanup():
             db = SessionLocal()
             refunded_count = await cleanup_expired_escrows(db)
             if refunded_count > 0:
-                print(f"🔄 AUTO CLEANUP: Refunded {refunded_count} expired escrows")
+                print(f"AUTO CLEANUP: Refunded {refunded_count} expired escrows")
         except Exception as e:
-            print(f"❌ Auto escrow cleanup error: {e}")
+            print(f"Auto escrow cleanup error: {e}")
         finally:
             if db:
                 db.close()
@@ -2787,7 +2787,7 @@ async def check_database_rate_limits(username: str, code: str, amount_usd: float
     if amount_usd > MAX_SINGLE_CLAIM_USD:
         return False, f"Single claim too large: ${amount_usd}/${MAX_SINGLE_CLAIM_USD}"
 
-    print(f"✅ Rate limits passed: {hourly_count} claims, ${hourly_usd_total:.2f} USD this hour")
+    print(f"Rate limits passed: {hourly_count} claims, ${hourly_usd_total:.2f} USD this hour")
     return True, "Rate limits passed"
 
 app = FastAPI()
@@ -3178,7 +3178,7 @@ async def websocket_relay():
 </html>"""
     return HTMLResponse(content=html_content)
 
-# SECURITY: Centralized dual authentication dependency for all endpoints
+# Centralized dual authentication dependency for all endpoints
 async def verify_dual_auth(request: Request, expected_user: str = None) -> str:
     """
     CRITICAL: Unified authentication that accepts either session auth OR signed iframe/API tokens
@@ -3211,7 +3211,7 @@ async def verify_dual_auth(request: Request, expected_user: str = None) -> str:
     if not api_token:
         raise HTTPException(status_code=401, detail="Authentication required: session or API token")
 
-    # CRITICAL: Validate WS_SECRET is set for token validation
+    # Validate WS_SECRET is set for token validation
     if not WS_SECRET:
         raise HTTPException(status_code=500, detail="Server authentication configuration error")
 
@@ -3223,14 +3223,14 @@ async def verify_dual_auth(request: Request, expected_user: str = None) -> str:
 
         token_user = parts[0]
 
-        # CRITICAL: For user-scoped endpoints, ALWAYS enforce user binding
+        # For user-scoped endpoints, ALWAYS enforce user binding
         if expected_user:
             if token_user != expected_user:
                 raise HTTPException(status_code=401, detail="Token user mismatch")
         # For endpoints without expected_user (like voucher-info), allow any valid token
         # but log for security monitoring
         else:
-            print(f"⚠️ Token validation without expected_user for token_user: {token_user}")
+            print(f"Warning: Token validation without expected_user for token_user: {token_user}")
 
         # Validate token signature and expiry
         if not validate_iframe_token(api_token, token_user):
@@ -3243,7 +3243,7 @@ async def verify_dual_auth(request: Request, expected_user: str = None) -> str:
     except Exception:
         raise HTTPException(status_code=401, detail="Token validation failed")
 
-# SECURITY: Token validation for iframe sessions
+# Token validation for iframe sessions
 def validate_iframe_token(token: str, expected_user: str) -> bool:
     """Validate signed iframe token to prevent secret exposure"""
     try:
@@ -3291,8 +3291,7 @@ sse_heartbeat_task = None
 
 # SSE Heartbeat Configuration - CONNECTION HEALTH MONITORING
 SSE_PING_INTERVAL = 15.0  # Send ping every 15 seconds to keep connection alive
-SSE_PING_TIMEOUT = None   # DISABLED: No timeout - connections stay alive until user disconnects
-
+SSE_PING_TIMEOUT = None   
 # ENHANCED CONNECTION MONITORING: Track connection metrics for 300+ users
 connection_metrics = {
     'total_connections': 0,
@@ -3372,7 +3371,7 @@ def check_circuit_breaker() -> tuple[bool, str]:
             # Reset circuit breaker
             circuit_breaker_state['is_open'] = False
             circuit_breaker_state['failure_count'] = 0
-            print(f"🔄 CIRCUIT BREAKER RESET after {time_since_failure:.1f}s")
+            print(f"CIRCUIT BREAKER RESET after {time_since_failure:.1f}s")
         else:
             circuit_breaker_state['total_rejections'] += 1
             time_remaining = circuit_breaker_state['reset_timeout'] - time_since_failure
@@ -3476,7 +3475,7 @@ async def _check_user_credits_db_async(username: str) -> float:
         total_credits = await loop.run_in_executor(None, sync_db_check)
         return total_credits
     except Exception as e:
-        print(f"⚠️ Async credit check failed for {username}: {e}")
+        print(f"Warning: Async credit check failed for {username}: {e}")
         return 0.0
 
 def _check_user_credits_db(username: str) -> float:
@@ -3484,12 +3483,12 @@ def _check_user_credits_db(username: str) -> float:
     try:
         db = SessionLocal()
         user = db.query(User).filter(User.username == username).first()
-        # CRITICAL FIX: Return total usable credits (available + reserved)
+        # Return total usable credits (available + reserved)
         total_credits = (user.credits + user.reserved_credits) if user else Decimal('0.0')
         db.close()
         return total_credits
     except Exception as e:
-        print(f"⚠️ Credit check failed for {username}: {e}")
+        print(f"Warning: Credit check failed for {username}: {e}")
         return 0.0
 
 def _check_user_credits(username: str) -> float:
@@ -3508,11 +3507,11 @@ async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[obj
             # Single query - get or create user
             user = db.query(User).filter(User.username == username).first()
             if not user:
-                # CRITICAL FIX: Give new users $0.5 starter credits (consistent with _get_or_create_user)  
+                # Give new users $0.5 starter credits (consistent with _get_or_create_user)  
                 user = User(username=username, credits=Decimal('0.5'), reserved_credits=Decimal('0.0'))
                 db.add(user)
                 db.commit()
-                print(f"👤 New user '{username}' created with $0.5 starter credits (pre-authorization)")
+                print(f"User: New user '{username}' created with $0.5 starter credits (pre-authorization)")
                 db.refresh(user)
 
             # Get current credits (not yet reserved) - all in same transaction
@@ -3531,7 +3530,7 @@ async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[obj
                         'credits': Decimal('0.0'),
                         'authorized_until': float('inf')
                     }
-                    print(f"✅ CONSOLIDATED: {username} using ${current_reserved} existing reserved credits")
+                    print(f"CONSOLIDATED: {username} using ${current_reserved} existing reserved credits")
                 else:
                     print(f"🚫 CONSOLIDATED: {username} has $0 available and $0 reserved")
 
@@ -3563,7 +3562,7 @@ async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[obj
             credit_cache[username] = total_reserved  # Total usable credits (now all reserved)
             credit_cache_last_update[username] = current_time
 
-            print(f"🚀 CONSOLIDATED 100%: {username} - ${available_credits} moved to reserved (total reserved: ${total_reserved})")
+            print(f"CONSOLIDATED 100%: {username} - ${available_credits} moved to reserved (total reserved: ${total_reserved})")
             return user, total_reserved
 
         except Exception as e:
@@ -3578,7 +3577,7 @@ async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[obj
         result = await loop.run_in_executor(None, sync_operation)
         return result
     except Exception as e:
-        print(f"❌ CONSOLIDATED OPERATION FAILED for {username}: {e}")
+        print(f"CONSOLIDATED OPERATION FAILED for {username}: {e}")
         return None, 0.0
 
 def _preauthorize_user_credits(username: str) -> float:
@@ -3598,7 +3597,7 @@ def _preauthorize_user_credits(username: str) -> float:
         current_reserved = user.reserved_credits
 
         if available_credits <= 0:
-            # CRITICAL FIX: Only create authorization if user has ANY reserved credits
+            # Only create authorization if user has ANY reserved credits
             if current_reserved > 0:
                 # User has previously reserved credits but no new credits to reserve
                 user_authorizations[username] = {
@@ -3609,7 +3608,7 @@ def _preauthorize_user_credits(username: str) -> float:
                     'credits': Decimal('0.0'),      # User had no available credits
                     'authorized_until': float('inf')  # Unlimited time authorization
                 }
-                print(f"✅ USING RESERVED: {username} has $0 available but ${current_reserved} already reserved")
+                print(f"USING RESERVED: {username} has $0 available but ${current_reserved} already reserved")
             else:
                 # User has absolutely no credits - do NOT create authorization
                 print(f"🚫 ZERO CREDITS: {username} has $0 available and $0 reserved - no authorization created")
@@ -3646,12 +3645,12 @@ def _preauthorize_user_credits(username: str) -> float:
         credit_cache[username] = total_reserved  # Total usable credits (now all reserved)
         credit_cache_last_update[username] = current_time
 
-        print(f"🚀 100% RESERVED: {username} - ${available_credits} moved to reserved (total reserved: ${total_reserved})")
+        print(f"100% RESERVED: {username} - ${available_credits} moved to reserved (total reserved: ${total_reserved})")
         db.close()
         return total_reserved
 
     except Exception as e:
-        print(f"❌ RESERVATION FAILED for {username}: {e}")
+        print(f"RESERVATION FAILED for {username}: {e}")
         if 'db' in locals():
             db.rollback()
             db.close()
@@ -3707,7 +3706,7 @@ def _is_user_preauthorized_fast(username: str) -> bool:
 
         task = asyncio.create_task(_debounced_refresh())
         pending_refresh_tasks[username] = task
-        print(f"🚀 TIME-DEBOUNCED REFRESH: Scheduled for {username} (available: ${auth_data.get('available', 0)}, cooldown: {REFRESH_COOLDOWN}s)")
+        print(f"TIME-DEBOUNCED REFRESH: Scheduled for {username} (available: ${auth_data.get('available', 0)}, cooldown: {REFRESH_COOLDOWN}s)")
     elif auth_data.get('available', 0) < 1.0 and username in refresh_in_progress:
         print(f"⏳ REFRESH IN PROGRESS: Skipping refresh for {username} (already running)")
     elif auth_data.get('available', 0) < 1.0:
@@ -3725,7 +3724,7 @@ def _is_user_preauthorized(username: str) -> bool:
     auth_data = user_authorizations[username]
     current_time = time.time()
 
-    # CRITICAL FIX: Auto-refresh authorization if credits are low (unlimited time authorization)
+    # Auto-refresh authorization if credits are low (unlimited time authorization)
     if auth_data['available'] < 1.0:  # Less than $1 available
         _refresh_user_authorization(username)
         # Re-check after refresh
@@ -3768,12 +3767,12 @@ async def _cleanup_user_authorization(username: str):
                     credit_cache[username] = user.credits
                     credit_cache_last_update[username] = time.time()
 
-                    print(f"🔄 RELEASED RESERVATION: {username} - ${reserved_amount} moved back to available credits")
+                    print(f"RELEASED RESERVATION: {username} - ${reserved_amount} moved back to available credits")
                 else:
-                    print(f"🔄 DISCONNECT CLEANUP: {username} had $0 reserved credits to release")
+                    print(f"DISCONNECT CLEANUP: {username} had $0 reserved credits to release")
 
         except Exception as e:
-            print(f"❌ FAILED to release reserved credits for {username}: {e}")
+            print(f"FAILED to release reserved credits for {username}: {e}")
             # Context manager handles db.close() and rollback automatically
 
         finally:
@@ -3830,7 +3829,7 @@ async def _consume_preauthorized_credit(username: str, fee_amount: float, code: 
                     return True
 
             except Exception as e:
-                print(f"⚠️ PreAuth logging failed for {username}: {e}")
+                print(f"Warning: PreAuth logging failed for {username}: {e}")
                 # Continue with consumption even if logging fails (performance priority)
                 auth_data['available'] = float(available_decimal - fee_decimal)
                 reserved_decimal = safe_decimal(auth_data.get('reserved', 0), '0')
@@ -3838,7 +3837,7 @@ async def _consume_preauthorized_credit(username: str, fee_amount: float, code: 
                 print(f"💳 FALLBACK INSTANT: Consumed ${fee_amount} from {username} pre-authorization (${auth_data['available']} remaining)")
                 return True
         else:
-            print(f"❌ PRE-AUTH INSUFFICIENT: {username} needs ${fee_amount}, has ${available_decimal} pre-authorized")
+            print(f"PRE-AUTH INSUFFICIENT: {username} needs ${fee_amount}, has ${available_decimal} pre-authorized")
             return False
 
 def _mark_preauth_committed(username: str):
@@ -3859,10 +3858,10 @@ def _mark_preauth_committed(username: str):
 
             # Clean up the tracking
             del user_authorizations[username]['preauth_record_id']
-            print(f"✅ PreAuth marked as committed for {username} (record: {record_id})")
+            print(f"PreAuth marked as committed for {username} (record: {record_id})")
 
         except Exception as e:
-            print(f"⚠️ Failed to mark preauth as committed for {username}: {e}")
+            print(f"Warning: Failed to mark preauth as committed for {username}: {e}")
 
 async def recover_uncommitted_preauth():
     """SECURITY: Recover pre-authorization credits lost due to server crashes"""
@@ -3913,24 +3912,24 @@ async def recover_uncommitted_preauth():
                         WHERE id = :record_id
                     """), {"record_id": record_id})
 
-                    print(f"🔄 RECOVERED: ${amount_consumed:.4f} → {username} from uncommitted pre-auth (code: {code})")
+                    print(f"RECOVERED: ${amount_consumed:.4f} → {username} from uncommitted pre-auth (code: {code})")
                     recovery_count += 1
 
                     # Invalidate credit cache
                     _invalidate_user_credits(username)
 
             except Exception as record_error:
-                print(f"❌ Failed to recover preauth record {record_id}: {record_error}")
+                print(f"Failed to recover preauth record {record_id}: {record_error}")
 
         if recovery_count > 0:
             db.commit()
-            print(f"✅ RECOVERY COMPLETE: Restored {recovery_count} uncommitted pre-authorizations")
+            print(f"RECOVERY COMPLETE: Restored {recovery_count} uncommitted pre-authorizations")
 
         db.close()
         return recovery_count
 
     except Exception as e:
-        print(f"❌ CRITICAL: PreAuth recovery failed: {e}")
+        print(f"CRITICAL: PreAuth recovery failed: {e}")
         if 'db' in locals():
             db.rollback()
             db.close()
@@ -3960,7 +3959,7 @@ async def cleanup_expired_preauth():
         return deleted_count
 
     except Exception as e:
-        print(f"❌ PreAuth cleanup failed: {e}")
+        print(f"PreAuth cleanup failed: {e}")
         if 'db' in locals():
             db.rollback()
             db.close()
@@ -3969,17 +3968,17 @@ async def cleanup_expired_preauth():
 async def preauth_recovery_service():
     """Background service for pre-authorization recovery and cleanup"""
     # Initial recovery on startup
-    print("🔄 Running initial pre-authorization recovery...")
+    print("Running initial pre-authorization recovery...")
     initial_recovery = await recover_uncommitted_preauth()
     if initial_recovery > 0:
-        print(f"🔄 STARTUP RECOVERY: Restored {initial_recovery} uncommitted pre-authorizations")
+        print(f"STARTUP RECOVERY: Restored {initial_recovery} uncommitted pre-authorizations")
 
     while True:
         try:
             # Recovery every 5 minutes
             recovery_count = await recover_uncommitted_preauth()
             if recovery_count > 0:
-                print(f"🔄 PERIODIC RECOVERY: Restored {recovery_count} uncommitted pre-authorizations")
+                print(f"PERIODIC RECOVERY: Restored {recovery_count} uncommitted pre-authorizations")
 
             # Cleanup every hour (12 cycles of 5 minutes)
             if int(time.time()) % 3600 < 300:  # Within first 5 minutes of each hour
@@ -3988,7 +3987,7 @@ async def preauth_recovery_service():
                     print(f"🧹 PERIODIC CLEANUP: Removed {cleanup_count} expired pre-auth records")
 
         except Exception as e:
-            print(f"❌ PreAuth recovery service error: {e}")
+            print(f"PreAuth recovery service error: {e}")
 
         # Run every 5 minutes
         await asyncio.sleep(300)
@@ -4050,10 +4049,10 @@ async def _refresh_user_authorization_async(username: str):
             credit_cache[username] = user_credits
             credit_cache_last_update[username] = current_time
 
-            print(f"🔄 TRULY ASYNC AUTHORIZATION REFILLED: {username} - window: ${refill_amount}, total: ${user_credits}")
+            print(f"TRULY ASYNC AUTHORIZATION REFILLED: {username} - window: ${refill_amount}, total: ${user_credits}")
 
         except Exception as e:
-            print(f"❌ ASYNC AUTHORIZATION REFRESH FAILED: {username} - {e}")
+            print(f"ASYNC AUTHORIZATION REFRESH FAILED: {username} - {e}")
             # Mark as unauthorized on error
             persistent_auth_cache[username] = False
             persistent_auth_cache_last_update[username] = current_time
@@ -4062,7 +4061,7 @@ def _refresh_user_authorization(username: str):
     """DEPRECATED: Legacy sync version - kept for compatibility during transition"""
     # Schedule async refresh instead of blocking
     asyncio.create_task(_refresh_user_authorization_async(username))
-    print(f"🔄 SCHEDULED ASYNC REFRESH for {username} (non-blocking)")
+    print(f"SCHEDULED ASYNC REFRESH for {username} (non-blocking)")
 
 def _invalidate_user_credits(username: str):
     """Invalidate cached credits after transactions to force refresh"""
@@ -4100,7 +4099,7 @@ async def _check_and_disconnect_zero_balance_users(username: str):
                         await sse_message_queues[username].put(disconnect_message)
                         print(f"📤 FINAL MESSAGE: Sent balance zero notification to {username}")
                     except Exception as msg_error:
-                        print(f"⚠️ Failed to send disconnect message to {username}: {msg_error}")
+                        print(f"Warning: Failed to send disconnect message to {username}: {msg_error}")
 
                 # Clean up SSE connections
                 sse_connections[username].clear()
@@ -4113,7 +4112,7 @@ async def _check_and_disconnect_zero_balance_users(username: str):
                 # Clean up pre-authorization
                 await _cleanup_user_authorization(username)
 
-                print(f"✅ DISCONNECTED: {username} removed from SSE connections due to zero balance")
+                print(f"DISCONNECTED: {username} removed from SSE connections due to zero balance")
                 return True
             else:
                 print(f"ℹ️  {username} has zero balance but no active SSE connection")
@@ -4123,7 +4122,7 @@ async def _check_and_disconnect_zero_balance_users(username: str):
             return False
 
     except Exception as e:
-        print(f"❌ Auto-disconnect check failed for {username}: {e}")
+        print(f"Auto-disconnect check failed for {username}: {e}")
         return False
 
 def _disconnect_user_from_all_connections(username: str):
@@ -4145,14 +4144,14 @@ def _disconnect_user_from_all_connections(username: str):
             # Clean up pre-authorization (async task for sync context)
             asyncio.create_task(_cleanup_user_authorization(username))
 
-            print(f"✅ FORCE DISCONNECTED: {username} removed from all connections")
+            print(f"FORCE DISCONNECTED: {username} removed from all connections")
             return True
         else:
             print(f"ℹ️  {username} has no active connections to disconnect")
             return False
 
     except Exception as e:
-        print(f"❌ Force disconnect failed for {username}: {e}")
+        print(f"Force disconnect failed for {username}: {e}")
         return False
 
 @app.post("/sse-pong")
@@ -4176,16 +4175,16 @@ async def sse_pong_endpoint(request: Request, connection_id: str = Query(...), t
 async def stream_events(user: str = Query(...), token: str = Query(...)):
     """Server-Sent Events endpoint for real-time code streaming"""
 
-    # SECURITY: Validate signed iframe token - no raw secrets accepted
+    # Validate signed iframe token - no raw secrets accepted
     if not WS_SECRET:
         raise HTTPException(status_code=500, detail="Server configuration error")
     if not validate_iframe_token(token, user):
         raise HTTPException(status_code=401, detail="Invalid or expired iframe token")
 
-    # CRITICAL FIX: Extract authenticated username from token (like fetchBalance does)
+    # Extract authenticated username from token (like fetchBalance does)
     authenticated_user = validate_and_extract_user(token)
     if authenticated_user != user:
-        print(f"⚠️ SSE user mismatch: query='{user}' vs token='{authenticated_user}' - using token user")
+        print(f"Warning: SSE user mismatch: query='{user}' vs token='{authenticated_user}' - using token user")
         user = authenticated_user  # Use the authenticated username from token
 
     # 🚀 OPTIMIZED: Single consolidated database operation for user setup
@@ -4195,10 +4194,10 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
 
         # If user has 0 credits, allow connection but warn (graceful degradation)
         if user_credits <= 0:
-            print(f"⚠️ SSE WARNING: {user} has $0 credits - connection allowed but codes will not be sent")
+            print(f"Warning: SSE WARNING: {user} has $0 credits - connection allowed but codes will not be sent")
             # Don't disconnect immediately - allow connection for balance updates
     except Exception as e:
-        print(f"❌ SSE CONNECTION SETUP FAILED for {user}: {e}")
+        print(f"SSE CONNECTION SETUP FAILED for {user}: {e}")
         raise HTTPException(status_code=500, detail="Connection setup failed")
 
     async def event_generator():
@@ -4206,7 +4205,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
         if user in sse_connections:
             old_connections = sse_connections[user].copy()
             if old_connections:
-                print(f"🔄 AUTO-DISCONNECT: Removing {len(old_connections)} existing connection(s) for {user}")
+                print(f"AUTO-DISCONNECT: Removing {len(old_connections)} existing connection(s) for {user}")
                 for old_conn_id in old_connections:
                     # Remove from health tracking
                     if old_conn_id in sse_connection_health:
@@ -4231,7 +4230,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
                 del sse_connections[user]
                 if user in sse_message_queues:
                     del sse_message_queues[user]
-                print(f"✅ Cleared all previous connections for {user} - allowing new connection")
+                print(f"Cleared all previous connections for {user} - allowing new connection")
         
         # Initialize user message queue if doesn't exist
         if user not in sse_message_queues:
@@ -4247,7 +4246,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
 
         connection_id = f"{user}_{int(time.time())}"
         sse_connections[user].append(connection_id)
-        print(f"✅ NEW SSE CONNECTION: {user} - connection_id: {connection_id} (total for user: {len(sse_connections[user])})")
+        print(f"NEW SSE CONNECTION: {user} - connection_id: {connection_id} (total for user: {len(sse_connections[user])})")
 
         # Initialize heartbeat tracking for this connection
         current_time = time.time()
@@ -4285,7 +4284,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
             message_queue = sse_message_queues[user]
             last_heartbeat = time.time()
 
-            # CRITICAL FIX: Separate timers for ping events and keepalive comments
+            # Separate timers for ping events and keepalive comments
             last_ping_sent = time.time()
             last_keepalive_sent = time.time()
 
@@ -4294,7 +4293,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
 
             while True:
                 try:
-                    # OPTIMIZED: Shorter timeout for faster message delivery during active periods
+                    # Shorter timeout for faster message delivery during active periods
                     message = await asyncio.wait_for(message_queue.get(), timeout=5.0)
 
                     # Send the message
@@ -4306,7 +4305,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
                     last_heartbeat = time.time()
 
                 except asyncio.TimeoutError:
-                    # CRITICAL FIX: Separate ping events and keepalive comments with independent timers
+                    # Separate ping events and keepalive comments with independent timers
                     current_time = time.time()
 
                     # Send ping messages on proper interval (every 10 seconds)
@@ -4375,7 +4374,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # CRITICAL: Disable proxy buffering for SSE
+            "X-Accel-Buffering": "no",  # Disable proxy buffering for SSE
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Cache-Control"
         }
@@ -4385,7 +4384,7 @@ async def stream_events(user: str = Query(...), token: str = Query(...)):
 async def embed_stream(request: Request, user: str = Query(...), nonce: str = Query(None)):
     """Hidden iframe endpoint for cross-origin SSE streaming"""
 
-    # SECURITY: Generate signed token for iframe session - no secrets exposed to client
+    # Generate signed token for iframe session - no secrets exposed to client
     if not WS_SECRET:
         raise HTTPException(status_code=500, detail="Server configuration error")
 
@@ -4408,7 +4407,7 @@ async def embed_stream(request: Request, user: str = Query(...), nonce: str = Qu
     # Create secure token that client can safely see, bound to nonce for additional security
     iframe_token = f"{payload}:{signature}"
 
-    # SECURITY: Strict origin and nonce validation to prevent token minting abuse
+    # Strict origin and nonce validation to prevent token minting abuse
     # Check Origin header first (more reliable than Referer)
     origin = request.headers.get("Origin", "")
     referer = request.headers.get("Referer", "")
@@ -4431,15 +4430,15 @@ async def embed_stream(request: Request, user: str = Query(...), nonce: str = Qu
     if candidate_origin and candidate_origin in ALLOWED_ORIGINS:
         parent_origin = candidate_origin
         # Enhanced logging for security monitoring
-        print(f"✅ Issued iframe token for user '{user}' from origin '{parent_origin}' with nonce '{nonce[:8]}...'")
+        print(f"Issued iframe token for user '{user}' from origin '{parent_origin}' with nonce '{nonce[:8]}...'")
     else:
         # Log suspicious access attempts for monitoring
-        print(f"⚠️ Unauthorized embed-stream access attempt from origin: {candidate_origin or 'unknown'}")
+        print(f"Warning: Unauthorized embed-stream access attempt from origin: {candidate_origin or 'unknown'}")
         raise HTTPException(status_code=403, detail="Unauthorized origin - iframe access only")
 
     # Require nonce for additional security (prevents direct navigation)
     if not nonce or len(nonce) < 8:
-        print(f"⚠️ Missing or invalid nonce in embed-stream request from: {parent_origin}")
+        print(f"Warning: Missing or invalid nonce in embed-stream request from: {parent_origin}")
         raise HTTPException(status_code=400, detail="Valid nonce required")
 
     # Minimal HTML page that establishes SSE connection and relays to parent
@@ -4796,7 +4795,7 @@ class WSManager:
             if existing_connection:
                 existing_ws = existing_connection['ws']
                 # Automatically disconnect old connection to allow new one
-                print(f"🔄 AUTO-DISCONNECT: Closing existing connection for {username} to allow new connection")
+                print(f"AUTO-DISCONNECT: Closing existing connection for {username} to allow new connection")
                 try:
                     # Send disconnect notification to old connection
                     await existing_ws.send_json({
@@ -4807,14 +4806,14 @@ class WSManager:
                     # Close the old connection
                     await existing_ws.close(code=1000, reason="New connection from same user")
                 except Exception as e:
-                    print(f"⚠️ Error closing old connection: {e}")
+                    print(f"Warning: Error closing old connection: {e}")
                 
                 # Clean up the old connection
                 await self._cleanup_dead_connection(existing_client_id)
-                print(f"✅ Previous connection for {username} closed - allowing new connection")
+                print(f"Previous connection for {username} closed - allowing new connection")
             else:
                 # Username in map but no active connection - clean up the mapping
-                print(f"🔄 Cleaning orphaned username mapping for {username}")
+                print(f"Cleaning orphaned username mapping for {username}")
                 self.username_map.pop(username, None)
 
         await ws.accept()
@@ -4828,20 +4827,16 @@ class WSManager:
         }
         self.username_map[username] = client_id
 
-        # DISABLED: Previous code delivery to prevent delays
-        # if username in self.reconnect_buffers:
+                # if username in self.reconnect_buffers:
         #     buffered_messages = self.reconnect_buffers[username]
         #     if buffered_messages:
-        #         print(f"🔄 Delivering {len(buffered_messages)} buffered messages to {username}")
-        #         
+        #         print(f"Delivering {len(buffered_messages)} buffered messages to {username}")
         #         # Send buffered messages concurrently for faster delivery - TRUE FIRE AND FORGET
         #         buffer_tasks = []
         #         for msg in buffered_messages[-50:]:  # Limit to last 50 messages
         #             # Fire and forget each buffered message - no waiting
         #             asyncio.create_task(self._fast_send(ws, msg, username))
-        #         
-        #         print(f"🚀 FIRED {len(buffered_messages[-50:])} buffered messages simultaneously")
-        #         
+        #         print(f"FIRED {len(buffered_messages[-50:])} buffered messages simultaneously")
         #     del self.reconnect_buffers[username]
 
         # Start heartbeat if first connection
@@ -4887,17 +4882,14 @@ class WSManager:
             else:
                 print(f"🔌 Client {client_id} ({username}) disconnected (username remapped)")
 
-            # DISABLED: Previous code buffering to prevent delays
-            # if username not in self.reconnect_buffers:
+                        # if username not in self.reconnect_buffers:
             #     self.reconnect_buffers[username] = []
-            # 
             # # Add recent messages to buffer (last 10 minutes of codes)
             # current_time = int(asyncio.get_event_loop().time() * 1000)
             # recent_messages = []
             # for entry in ring_get_all():
             #     if entry.get("type") == "code" and current_time - entry.get("ts", 0) < 600000:  # 10 minutes
             #         recent_messages.append(entry)
-            # 
             # # Store only the most recent messages to prevent buffer overflow
             # self.reconnect_buffers[username] = recent_messages[-20:]  # Keep last 20 codes
 
@@ -4907,7 +4899,7 @@ class WSManager:
 
     async def broadcast(self, message: Dict[str, Any], priority: bool = False):
         """Enhanced broadcast with priority handling and queuing"""
-        # CRITICAL FIX: Continue if there are SSE connections even with no WebSocket
+        # Continue if there are SSE connections even with no WebSocket
         if not self.active and not sse_message_queues:
             return
 
@@ -4963,7 +4955,7 @@ class WSManager:
                     continue
 
             except Exception as e:
-                print(f"❌ Queue processor error: {e}")
+                print(f"Queue processor error: {e}")
                 await asyncio.sleep(1)
 
         self.queue_processor_task = None
@@ -4994,7 +4986,7 @@ class WSManager:
             # SPEED OPTIMIZATION: Send codes to ALL connected users first, validate credits after
             # This eliminates the 1432ms delay from sequential database checks
             eligible_users = list(sse_message_queues.keys())
-            print(f"🚀 INSTANT BROADCAST: Sending code {message.get('code')} to {len(eligible_users)} connected users")
+            print(f"INSTANT BROADCAST: Sending code {message.get('code')} to {len(eligible_users)} connected users")
         else:
             # For non-code messages (ping, status, etc.), send to all users
             eligible_users = list(sse_message_queues.keys())
@@ -5034,7 +5026,7 @@ class WSManager:
         # Production monitoring
         elapsed = (asyncio.get_event_loop().time() - broadcast_start) * 1000
         if message.get("type") == "code":
-            print(f"⚡ SSE Code {message.get('code')} → {successful_broadcasts} customers ({elapsed:.1f}ms)")
+            print(f"SSE Code {message.get('code')} → {successful_broadcasts} customers ({elapsed:.1f}ms)")
 
     async def _validate_and_track_code_delivery(self, message: Dict[str, Any], successful_users: List[str]):
         """ASYNC: Validate credits and track code delivery AFTER successful broadcast with ACK system"""
@@ -5057,10 +5049,10 @@ class WSManager:
 
         # Log delivery tracking with message ID
         if authorized_users:
-            print(f"✅ Code {code} (msg:{message_id[:8]}) delivered to {len(authorized_users)} authorized users: {authorized_users[:3]}{'...' if len(authorized_users) > 3 else ''}")
+            print(f"Code {code} (msg:{message_id[:8]}) delivered to {len(authorized_users)} authorized users: {authorized_users[:3]}{'...' if len(authorized_users) > 3 else ''}")
 
         if unauthorized_users:
-            print(f"⚠️ Code {code} (msg:{message_id[:8]}) delivered to {len(unauthorized_users)} unauthorized users (will disconnect): {unauthorized_users[:3]}{'...' if len(unauthorized_users) > 3 else ''}")
+            print(f"Warning: Code {code} (msg:{message_id[:8]}) delivered to {len(unauthorized_users)} unauthorized users (will disconnect): {unauthorized_users[:3]}{'...' if len(unauthorized_users) > 3 else ''}")
 
             # Schedule disconnection for unauthorized users (non-blocking)
             for username in unauthorized_users:
@@ -5087,7 +5079,7 @@ class WSManager:
                     try:
                         sse_message_queues[username].put_nowait(delivery_ack_message)
                     except asyncio.QueueFull:
-                        print(f"⚠️ ACK queue full for {username}, skipping delivery confirmation")
+                        print(f"Warning: ACK queue full for {username}, skipping delivery confirmation")
 
         print(f"📊 DELIVERY METRICS: total={connection_metrics['total_code_deliveries']}, authorized={connection_metrics['authorized_deliveries']}, unauthorized={connection_metrics['unauthorized_deliveries']}")
 
@@ -5119,7 +5111,7 @@ class WSManager:
             print(f"🔌 DISCONNECTED: {username} (insufficient credits for code delivery)")
 
         except Exception as e:
-            print(f"❌ Failed to disconnect unauthorized user {username}: {e}")
+            print(f"Failed to disconnect unauthorized user {username}: {e}")
 
     async def _fast_sse_send(self, username: str, message_queue: asyncio.Queue, message: Dict[str, Any]) -> bool:
         """Ultra-fast SSE message delivery with stream health validation - FIXED ZOMBIE CONNECTIONS"""
@@ -5128,7 +5120,7 @@ class WSManager:
             if message.get("type") != "code":
                 # Only validate health for non-code messages (pings, status, etc.)
                 if not self._validate_sse_stream_health(username):
-                    print(f"🔄 STREAM HEALTH FAILED: Triggering reconnection for {username}")
+                    print(f"STREAM HEALTH FAILED: Triggering reconnection for {username}")
                     self._trigger_sse_reconnection(username)
                     return False
 
@@ -5149,14 +5141,14 @@ class WSManager:
             # Instant delivery - non-blocking with delivery confirmation
             message_queue.put_nowait(message)
 
-            # CRITICAL FIX: Mark successful delivery for stream health tracking
+            # Mark successful delivery for stream health tracking
             self._mark_sse_delivery_success(username)
             return True
 
         except asyncio.QueueFull:
             # ENHANCED BACKPRESSURE: Drop oldest message to make room for new one
             connection_metrics['queue_overflows'] += 1
-            print(f"⚠️ Queue full for {username} - dropping oldest message to make room")
+            print(f"Warning: Queue full for {username} - dropping oldest message to make room")
             try:
                 # Drop oldest message and add new one (graceful backpressure)
                 try:
@@ -5165,15 +5157,15 @@ class WSManager:
                 except asyncio.QueueEmpty:
                     pass
                 message_queue.put_nowait(message)  # Add new message
-                print(f"✅ Queue backpressure handled for {username} - dropped 1 old message")
+                print(f"Queue backpressure handled for {username} - dropped 1 old message")
                 return True
             except Exception as drop_error:
                 # If dropping oldest fails, then trigger reconnection as last resort
-                print(f"❌ Queue backpressure failed for {username}: {drop_error} - triggering reconnection")
+                print(f"Queue backpressure failed for {username}: {drop_error} - triggering reconnection")
                 self._trigger_sse_reconnection(username)
                 return False
         except Exception as e:
-            print(f"❌ SSE send error for {username}: {e} - triggering reconnection")
+            print(f"SSE send error for {username}: {e} - triggering reconnection")
             self._trigger_sse_reconnection(username)
             return False
 
@@ -5188,13 +5180,13 @@ class WSManager:
             if username not in sse_message_queues:
                 return False
 
-            # FIXED: Only check for actual connection failures, not message delivery issues
+            # Only check for actual connection failures, not message delivery issues
             current_time = time.time()
             if hasattr(self, '_sse_delivery_stats'):
                 user_stats = self._sse_delivery_stats.get(username, {})
                 failure_count = user_stats.get('recent_failures', 0)
 
-                # CRITICAL FIX: Only mark stale on excessive CONSECUTIVE failures (not time-based)
+                # Only mark stale on excessive CONSECUTIVE failures (not time-based)
                 # Changed from 60-second timeout to 10+ consecutive failures
                 if failure_count > 10:  # Only after 10+ consecutive delivery failures
                     print(f"🚨 STALE STREAM DETECTED: {username} - {failure_count} consecutive failures")
@@ -5202,7 +5194,7 @@ class WSManager:
 
             return True
         except Exception as e:
-            print(f"⚠️ Stream health validation error for {username}: {e}")
+            print(f"Warning: Stream health validation error for {username}: {e}")
             return False
 
     def _mark_sse_delivery_success(self, username: str):
@@ -5219,7 +5211,7 @@ class WSManager:
     def _trigger_sse_reconnection(self, username: str):
         """CRITICAL FIX: Force SSE reconnection by cleaning up stale connections"""
         try:
-            print(f"🔄 FORCING RECONNECTION for {username}")
+            print(f"FORCING RECONNECTION for {username}")
 
             # Track delivery failure
             if not hasattr(self, '_sse_delivery_stats'):
@@ -5258,10 +5250,10 @@ class WSManager:
             # Clean up authorization (will be recreated on reconnect) (async task for method context)
             asyncio.create_task(_cleanup_user_authorization(username))
 
-            print(f"✅ RECONNECTION TRIGGERED: {username} must reconnect to receive messages")
+            print(f"RECONNECTION TRIGGERED: {username} must reconnect to receive messages")
 
         except Exception as e:
-            print(f"❌ Error triggering reconnection for {username}: {e}")
+            print(f"Error triggering reconnection for {username}: {e}")
 
     async def _send_to_client(self, client_id: str, ws: WebSocket, message: Dict[str, Any]):
         try:
@@ -5397,7 +5389,7 @@ async def setup_bot_handlers():
         currency_input = event.pattern_match.group(1)
         rate = float(event.pattern_match.group(2))
 
-        # SECURITY: Centralized currency validation
+        # Centralized currency validation
         try:
             currency = validate_currency(currency_input)
         except ValueError as e:
@@ -5434,7 +5426,7 @@ async def setup_bot_handlers():
                 currency_input, rate_str = rate_pair.strip().split(':', 1)
                 rate = float(rate_str.strip())
 
-                # SECURITY: Centralized currency validation
+                # Centralized currency validation
                 try:
                     currency = validate_currency(currency_input)
                 except ValueError as e:
@@ -5493,8 +5485,7 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
     """Extract bonus codes and values using multiple patterns, prioritizing 'Code:' format"""
     if not text:
         return []
-    # DISABLED: Debug print statements (production mode)
-    # print(f"🔍 Input text: {repr(text)}")  # Debug print to see exact text
+        # print(f"🔍 Input text: {repr(text)}")  # Debug print to see exact text
 
     all_codes = []
 
@@ -5502,8 +5493,7 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
     try:
         pattern = re.compile(CODE_VALUE_PATTERN, re.IGNORECASE | re.MULTILINE | re.DOTALL)
         matches = pattern.findall(text)
-        # DISABLED: Debug print statements (production mode)
-        # print(f"🔍 Code+Value pattern -> Found: {matches}")  # Debug print
+                # print(f"🔍 Code+Value pattern -> Found: {matches}")  # Debug print
 
         for match in matches:
             if isinstance(match, tuple) and len(match) >= 1:
@@ -5511,10 +5501,9 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
                 value = match[1] if len(match) > 1 and match[1] else None
                 if code:
                     all_codes.append({"code": code, "value": value})
-                    # DISABLED: Debug print statements (production mode)
-                    # print(f"🎯 Found code with value: {code} = ${value}" if value else f"🎯 Found code: {code}")
+                                        # print(f"🎯 Found code with value: {code} = ${value}" if value else f"🎯 Found code: {code}")
     except Exception as e:
-        print(f"⚠️ Code+Value pattern error: {e}")
+        print(f"Warning: Code+Value pattern error: {e}")
 
     # Then try all regular patterns (only for codes without values)
     for i, pattern_str in enumerate(CODE_PATTERNS):
@@ -5522,8 +5511,7 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
             pattern = re.compile(pattern_str, re.IGNORECASE | re.MULTILINE)
             matches = pattern.findall(text)
 
-            # DISABLED: Debug print statements (production mode)
-            # print(f"🔍 Pattern {i+1}: {pattern_str} -> Found: {matches}")  # Debug print
+                        # print(f"🔍 Pattern {i+1}: {pattern_str} -> Found: {matches}")  # Debug print
             # Handle both string and tuple results
             for match in matches:
                 if isinstance(match, tuple):
@@ -5541,11 +5529,10 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
                     if not already_exists:
                         all_codes.append({"code": code, "value": None})
         except Exception as e:
-            print(f"⚠️ Pattern error for {pattern_str}: {e}")
+            print(f"Warning: Pattern error for {pattern_str}: {e}")
             continue
 
-    # DISABLED: Debug print statements (production mode)
-    # print(f"🔍 All extracted codes before filtering: {all_codes}")  # Debug print
+        # print(f"🔍 All extracted codes before filtering: {all_codes}")  # Debug print
 
     # Filter and validate codes
     valid_codes = []
@@ -5566,8 +5553,7 @@ def extract_codes_with_values(text: str) -> List[Dict[str, Any]]:
         if not any(existing["code"] == code for existing in unique_codes):
             unique_codes.append(item)
 
-    # DISABLED: Debug print statements (production mode)
-    # print(f"🔍 Final extracted codes: {unique_codes}")
+        # print(f"🔍 Final extracted codes: {unique_codes}")
     return unique_codes
 
 def extract_codes(text: str) -> List[str]:
@@ -5595,24 +5581,24 @@ async def force_disconnect_all():
     global tg_client
     try:
         if tg_client:
-            print("🔄 Force disconnecting existing Telegram client...")
+            print("Force disconnecting existing Telegram client...")
             try:
                 if tg_client.is_connected():
                     await asyncio.wait_for(tg_client.disconnect(), timeout=5.0)
-                    print("✅ Previous connection disconnected successfully")
+                    print("Previous connection disconnected successfully")
             except Exception as e:
-                print(f"⚠️ Error disconnecting previous client: {e}")
+                print(f"Warning: Error disconnecting previous client: {e}")
             finally:
                 tg_client = None
     except Exception as e:
-        print(f"⚠️ Force disconnect error: {e}")
+        print(f"Warning: Force disconnect error: {e}")
 
 async def check_connection_health():
     """Check if Telegram connection is healthy and reconnect if needed"""
     global tg_client, telegram_connected
     try:
         if not tg_client or not tg_client.is_connected():
-            print("⚠️ Connection health check failed - connection lost")
+            print("Warning: Connection health check failed - connection lost")
             telegram_connected = False
             return False
 
@@ -5621,11 +5607,11 @@ async def check_connection_health():
             await asyncio.wait_for(tg_client.get_me(), timeout=5.0)
             return True
         except Exception as e:
-            print(f"⚠️ Connection health check failed: {e}")
+            print(f"Warning: Connection health check failed: {e}")
             telegram_connected = False
             return False
     except Exception as e:
-        print(f"⚠️ Error during connection health check: {e}")
+        print(f"Warning: Error during connection health check: {e}")
         return False
 
 async def ensure_tg(force_reconnect=False):
@@ -5637,12 +5623,12 @@ async def ensure_tg(force_reconnect=False):
 
     # Check if we already have a connected client
     if tg_client and tg_client.is_connected() and not force_reconnect:
-        print("✅ Using existing Telegram connection")
+        print("Using existing Telegram connection")
         return tg_client
 
-    print(f"🔐 Creating Telegram client with session: {TG_SESSION}")
-    print(f"🔐 API_ID: {TG_API_ID}")
-    print(f"🔐 API_HASH: {'*' * len(TG_API_HASH) if TG_API_HASH else 'Not set'}")
+    print(f"Auth: Creating Telegram client with session: {TG_SESSION}")
+    print(f"Auth: API_ID: {TG_API_ID}")
+    print(f"Auth: API_HASH: {'*' * len(TG_API_HASH) if TG_API_HASH else 'Not set'}")
 
     # Retry logic for connection
     max_retries = 3
@@ -5658,13 +5644,13 @@ async def ensure_tg(force_reconnect=False):
 
             # Add timeout to prevent hanging
             await asyncio.wait_for(client.connect(), timeout=15.0)
-            print("✅ Connected to Telegram successfully!")
+            print("Connected to Telegram successfully!")
 
             print("🔍 Checking authorization status...")
             is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=10.0)
 
             if not is_authorized:
-                print("❌ Session not authorized!")
+                print("Session not authorized!")
                 phone = os.getenv("TG_PHONE")
                 login_code = os.getenv("TG_LOGIN_CODE")
                 if not phone or not login_code:
@@ -5673,39 +5659,39 @@ async def ensure_tg(force_reconnect=False):
                 await asyncio.wait_for(client.send_code_request(phone), timeout=15.0)
                 try:
                     await asyncio.wait_for(client.sign_in(phone=phone, code=login_code), timeout=15.0)
-                    print("✅ Signed in successfully!")
+                    print("Signed in successfully!")
                 except SessionPasswordNeededError:
                     print("🔐 2FA required...")
                     pw = os.getenv("TG_2FA_PASSWORD")
                     if not pw:
                         raise RuntimeError("2FA required. Set TG_2FA_PASSWORD environment variable.")
                     await asyncio.wait_for(client.sign_in(password=pw), timeout=15.0)
-                    print("✅ 2FA authentication successful!")
+                    print("2FA authentication successful!")
             else:
-                print("✅ Session already authorized!")
+                print("Session already authorized!")
 
             tg_client = client
             print("🎉 Telegram client setup complete!")
             return client
 
         except asyncio.TimeoutError:
-            print(f"❌ TELEGRAM CONNECTION TIMEOUT (attempt {attempt + 1}/{max_retries})")
+            print(f"TELEGRAM CONNECTION TIMEOUT (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                print(f"🔄 Retrying in {retry_delay} seconds...")
+                print(f"Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
             else:
-                print("❌ All connection attempts failed")
+                print("All connection attempts failed")
                 raise RuntimeError("Telegram connection timeout after all retries")
 
         except Exception as e:
             error_msg = str(e).lower()
-            print(f"❌ TELEGRAM CLIENT ERROR (attempt {attempt + 1}/{max_retries}): {e}")
-            print(f"❌ Error type: {type(e).__name__}")
+            print(f"TELEGRAM CLIENT ERROR (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"Error type: {type(e).__name__}")
 
             # Handle specific "already connected" errors
             if "already" in error_msg and "connect" in error_msg:
-                print("🔄 'Already connected' error detected - forcing reconnection...")
+                print("'Already connected' error detected - forcing reconnection...")
                 await force_disconnect_all()
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
@@ -5713,7 +5699,7 @@ async def ensure_tg(force_reconnect=False):
                     continue
 
             if attempt < max_retries - 1:
-                print(f"🔄 Retrying in {retry_delay} seconds...")
+                print(f"Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2
             else:
@@ -5734,7 +5720,7 @@ async def telegram_keepalive(client):
                     await client(functions.PingRequest(ping_id=int(time.time())))
                     # Silently succeed - no log spam
                 except Exception as e:
-                    print(f"⚠️ Keepalive ping failed: {e}")
+                    print(f"Warning: Keepalive ping failed: {e}")
             else:
                 # Client disconnected, exit this keepalive task
                 print("🔌 Keepalive: Client disconnected, stopping pings")
@@ -5744,7 +5730,7 @@ async def telegram_keepalive(client):
             print("🛑 Keepalive task cancelled")
             break
         except Exception as e:
-            print(f"⚠️ Keepalive error: {e}")
+            print(f"Warning: Keepalive error: {e}")
             await asyncio.sleep(5)
 
 async def start_listener():
@@ -5757,7 +5743,7 @@ async def start_listener():
         client = None
         try:
             connection_attempt += 1
-            print(f"🚀 Starting Telegram listener (attempt {connection_attempt})...")
+            print(f"Starting Telegram listener (attempt {connection_attempt})...")
 
             # Force fresh connection on retry attempts
             force_reconnect = connection_attempt > 1
@@ -5765,26 +5751,26 @@ async def start_listener():
             try:
                 client = await asyncio.wait_for(ensure_tg(force_reconnect=force_reconnect), timeout=30.0)
                 if not client:
-                    print("❌ Failed to ensure Telegram client. Retrying in 3 seconds...")
+                    print("Failed to ensure Telegram client. Retrying in 3 seconds...")
                     await asyncio.sleep(3)
                     continue
             except asyncio.TimeoutError:
-                print(f"❌ TELEGRAM SETUP TIMEOUT (attempt {connection_attempt})")
-                print("🔄 Retrying with force reconnect in 3 seconds...")
+                print(f"TELEGRAM SETUP TIMEOUT (attempt {connection_attempt})")
+                print("Retrying with force reconnect in 3 seconds...")
                 await asyncio.sleep(3)
                 continue
             except Exception as e:
                 error_msg = str(e).lower()
-                print(f"❌ Connection error (attempt {connection_attempt}): {e}")
+                print(f"Connection error (attempt {connection_attempt}): {e}")
 
                 # Handle "already connected" or similar errors
                 if "already" in error_msg or "connect" in error_msg:
-                    print("🔄 Connection conflict detected - forcing fresh connection...")
+                    print("Connection conflict detected - forcing fresh connection...")
                     await force_disconnect_all()
                     await asyncio.sleep(2)
                     continue
 
-                print(f"🔄 Retrying in 3 seconds...")
+                print(f"Retrying in 3 seconds...")
                 await asyncio.sleep(3)
                 continue
 
@@ -5808,16 +5794,16 @@ async def start_listener():
                     entity = await client.get_entity(int(channel) if channel.lstrip('-').isdigit() else channel)
                     channel_name = entity.title if hasattr(entity, 'title') else (entity.first_name or f"Channel_{entity.id}")
                     channel_names[str(entity.id)] = channel_name
-                    print(f"✅ [{i+1}] Successfully connected to: {channel_name} (ID: {entity.id})")
+                    print(f"[{i+1}] Successfully connected to: {channel_name} (ID: {entity.id})")
                     # Convert to proper format for event listener
                     channel_for_events = int(channel) if channel.lstrip('-').isdigit() else channel
                     valid_channels.append(channel_for_events)
                 except Exception as e:
-                    print(f"❌ [{i+1}] Could not access channel {channel}: {e}")
+                    print(f"[{i+1}] Could not access channel {channel}: {e}")
                     print(f"   Make sure you're a member of this channel/chat")
                     print("   Skipping this channel...")
             if not valid_channels:
-                print("❌ No valid channels found. Please check your CHANNELS environment variable")
+                print("No valid channels found. Please check your CHANNELS environment variable")
                 return
             print(f"🎯 Setting up event listener for {len(valid_channels)} channels: {valid_channels}")
 
@@ -5826,7 +5812,7 @@ async def start_listener():
                 # PRIORITY: Process message immediately without any delays
                 channel_name = channel_names.get(str(ev.chat_id), f"Unknown_{ev.chat_id}")
                 # ULTRA-FAST: Minimal logging for speed
-                print(f"⚡ INSTANT MESSAGE from {channel_name}")
+                print(f"INSTANT MESSAGE from {channel_name}")
                 # Get message text
                 text = (ev.message.message or "")
                 # Add caption if it exists (for media messages)
@@ -5835,9 +5821,9 @@ async def start_listener():
                 # ULTRA-FAST: Extract codes immediately
                 codes_with_values = extract_codes_with_values(text)
                 if codes_with_values:
-                    print(f"⚡ FOUND {len(codes_with_values)} codes")
+                    print(f"FOUND {len(codes_with_values)} codes")
                 if not codes_with_values:
-                    print("❌ No valid codes found in message")
+                    print("No valid codes found in message")
                     return
                 ts = int(ev.message.date.timestamp() * 1000)
                 broadcast_count = 0
@@ -5848,7 +5834,7 @@ async def start_listener():
                     code = item["code"]
                     value = item["value"]
                     if code in seen:
-                        print(f"⚠️ Code {code} already seen, skipping")
+                        print(f"Warning: Code {code} already seen, skipping")
                         continue
                     seen.add(code)
                     # Enhanced entry with more metadata
@@ -5874,26 +5860,26 @@ async def start_listener():
                     ring_add(entry)
                     entries_to_broadcast.append(entry)
                     broadcast_count += 1
-                    print(f"⚡ PREPARED #{broadcast_count}: {code}")
+                    print(f"PREPARED #{broadcast_count}: {code}")
 
                 # Broadcast all codes simultaneously
                 if entries_to_broadcast:
                     # Create all broadcast tasks at once for true simultaneous sending
                     broadcast_tasks = [asyncio.create_task(ws_manager.broadcast(entry)) for entry in entries_to_broadcast]
-                    print(f"⚡ BROADCASTING {len(broadcast_tasks)} codes SIMULTANEOUSLY to all clients")
+                    print(f"BROADCASTING {len(broadcast_tasks)} codes SIMULTANEOUSLY to all clients")
                     # Optional: await all tasks to ensure they complete
                     # await asyncio.gather(*broadcast_tasks, return_exceptions=True)
 
             # Register handler explicitly (prevents duplication on reconnect)
             client.add_event_handler(message_handler, events.NewMessage(chats=valid_channels))
-            print("✅ Event handler registered for new messages")
+            print("Event handler registered for new messages")
             
             # Update global status
             telegram_connected = True
             print("🎉 Event listener setup complete! Ready to receive messages...")
-            print("🚀 Starting Telegram client and listening for messages...")
+            print("Starting Telegram client and listening for messages...")
             await client.start()
-            print("✅ Telegram client started successfully!")
+            print("Telegram client started successfully!")
             
             # Start keepalive ping task to prevent idle disconnection
             keepalive_task = asyncio.create_task(telegram_keepalive(client))
@@ -5902,7 +5888,7 @@ async def start_listener():
             try:
                 await client.run_until_disconnected()
             finally:
-                # CRITICAL: Always cleanup resources before reconnect
+                # Always cleanup resources before reconnect
                 print("🧹 Cleaning up resources before reconnect...")
                 telegram_connected = False
                 
@@ -5913,25 +5899,25 @@ async def start_listener():
                         await keepalive_task
                     except asyncio.CancelledError:
                         pass
-                    print("✅ Keepalive task cancelled")
+                    print("Keepalive task cancelled")
                 
                 # Remove event handler to prevent duplication
                 if client and message_handler:
                     try:
                         client.remove_event_handler(message_handler)
-                        print("✅ Event handler removed")
+                        print("Event handler removed")
                     except Exception as cleanup_err:
-                        print(f"⚠️ Could not remove handler: {cleanup_err}")
+                        print(f"Warning: Could not remove handler: {cleanup_err}")
 
             # Connection dropped - prepare to reconnect
-            print("⚠️ Telegram disconnected - connection lost")
-            print("🔄 Auto-reconnecting in 5 seconds...")
+            print("Warning: Telegram disconnected - connection lost")
+            print("Auto-reconnecting in 5 seconds...")
             await asyncio.sleep(5 + random.random() * 2)  # Add jitter to prevent thundering herd
             continue
 
         except Exception as e:
-            print(f"❌ LISTENER ERROR: {e}")
-            print(f"❌ Error type: {type(e).__name__}")
+            print(f"LISTENER ERROR: {e}")
+            print(f"Error type: {type(e).__name__}")
             telegram_connected = False
             
             # Cancel keepalive task on error
@@ -5943,7 +5929,7 @@ async def start_listener():
                     pass
             
             # Always retry after error with jitter
-            print(f"🔄 Retrying after error in 5 seconds...")
+            print(f"Retrying after error in 5 seconds...")
             await asyncio.sleep(5 + random.random() * 2)  # Add jitter to prevent thundering herd
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -5965,7 +5951,7 @@ async def api_root():
 @app.on_event("startup")
 async def startup_event():
     # 🛡️ FIRST: Run crash recovery to release any stranded reserved credits
-    print("🔄 Running startup reconciliation for stranded reserved credits...")
+    print("Running startup reconciliation for stranded reserved credits...")
     startup_reconciliation()
 
     # Enhanced database initialization with validation
@@ -5975,24 +5961,24 @@ async def startup_event():
         db_url = DATABASE_URL or "sqlite:///./test.db"
         if DATABASE_URL:
             if DATABASE_URL.startswith("postgresql"):
-                print(f"✅ Using Supabase PostgreSQL database")
+                print(f"Using Supabase PostgreSQL database")
             else:
-                print(f"✅ Using PostgreSQL database")
+                print(f"Using PostgreSQL database")
         else:
-            print("⚠️  WARNING: DATABASE_URL not set - using SQLite fallback for development")
+            print("Warning:  WARNING: DATABASE_URL not set - using SQLite fallback for development")
             print("   For production, please set DATABASE_URL to your Supabase connection string")
 
         # Test database connection
         with engine.connect() as conn:
             result = conn.execute(text("SELECT 1")).scalar()
             if result == 1:
-                print("✅ Database connection successful")
+                print("Database connection successful")
             else:
-                print("❌ Database connection test failed")
+                print("Database connection test failed")
 
         # Create all tables
         Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created/verified")
+        print("Database tables created/verified")
 
         # Verify critical tables exist
         with engine.connect() as conn:
@@ -6016,14 +6002,14 @@ async def startup_event():
                 if result:
                     existing_tables.append(table)
 
-            print(f"✅ Verified tables exist: {', '.join(existing_tables)}")
+            print(f"Verified tables exist: {', '.join(existing_tables)}")
             missing_tables = set(tables_to_check) - set(existing_tables)
             if missing_tables:
-                print(f"⚠️  Missing tables: {', '.join(missing_tables)}")
+                print(f"Warning:  Missing tables: {', '.join(missing_tables)}")
                 print("   If using Supabase, run the supabase_schema.sql script in the SQL editor")
 
     except Exception as e:
-        print(f"❌ Database initialization error: {e}")
+        print(f"Database initialization error: {e}")
         print(f"   Error type: {type(e).__name__}")
         if DATABASE_URL:
             print("   Check your DATABASE_URL connection string")
@@ -6031,25 +6017,25 @@ async def startup_event():
         else:
             print("   Set DATABASE_URL environment variable for production use")
 
-    # CRITICAL: Load admin rates from database on startup
+    # Load admin rates from database on startup
     print("💾 Loading admin rates from database...")
     load_admin_rates_from_db()
 
     # Start automatic connection cleanup
-    print("🔄 Starting automatic database connection cleanup...")
+    print("Starting automatic database connection cleanup...")
     asyncio.create_task(cleanup_idle_connections())
 
     # SECURITY FIX: Start pre-authorization recovery system
-    print("🔄 Starting pre-authorization recovery system...")
+    print("Starting pre-authorization recovery system...")
     asyncio.create_task(preauth_recovery_service())
 
     # Note: Removed complex escrow cleanup - using simple immediate deduction now
 
-    print("🚀 STAKE ULTRA CLAIMER - RENDER DEPLOYMENT")
+    print("STAKE ULTRA CLAIMER - RENDER DEPLOYMENT")
     print("=" * 50)
-    print(f"📡 Server starting on port {PORT}")
-    print(f"🔑 TG_API_ID configured: {'✅' if TG_API_ID else '❌'}")
-    print(f"🔑 TG_API_HASH configured: {'✅' if TG_API_HASH else '❌'}")
+    print(f"Server starting on port {PORT}")
+    print(f"Token: TG_API_ID configured: {'✅' if TG_API_ID else '❌'}")
+    print(f"Token: TG_API_HASH configured: {'✅' if TG_API_HASH else '❌'}")
     print(f"📺 CHANNELS configured: {'✅' if CHANNELS else '❌'}")
     # TIMEOUT FIX: Skip Telegram if using dummy/invalid credentials
     is_valid_telegram = (
@@ -6060,11 +6046,11 @@ async def startup_event():
     
     if is_valid_telegram:
         channel_count = len([ch.strip() for ch in CHANNELS.split(',') if ch.strip()])
-        print(f"🚀 Starting Telegram listener for {channel_count} channels: {CHANNELS}")
-        print("⚡ Ultra-fast code extraction and broadcasting enabled")
+        print(f"Starting Telegram listener for {channel_count} channels: {CHANNELS}")
+        print("Ultra-fast code extraction and broadcasting enabled")
         asyncio.create_task(start_listener())
     else:
-        print("⚠️ Telegram listener DISABLED - Invalid or dummy credentials detected")
+        print("Warning: Telegram listener DISABLED - Invalid or dummy credentials detected")
         print("   Set these environment variables for Telegram monitoring:")
         print("   - TG_API_ID (Get from https://my.telegram.org/apps)")
         print("   - TG_API_HASH (Get from https://my.telegram.org/apps)")
@@ -6072,7 +6058,7 @@ async def startup_event():
         print("   ✅ Server will run normally without Telegram (web interface still works)")
     # Start keep-alive service
     if keep_alive_service:
-        print(f"🔄 Starting keep-alive service (ping every {KEEP_ALIVE_INTERVAL} minutes)")
+        print(f"Starting keep-alive service (ping every {KEEP_ALIVE_INTERVAL} minutes)")
         asyncio.create_task(keep_alive_service.start_keep_alive())
     else:
         print("ℹ️ Keep-alive service disabled")
@@ -6080,7 +6066,7 @@ async def startup_event():
     # Start Telegram bot
     if bot and TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID:
         print(f"🤖 Starting Telegram voucher bot...")
-        print(f"🔑 Admin ID: {TELEGRAM_ADMIN_ID}")
+        print(f"Token: Admin ID: {TELEGRAM_ADMIN_ID}")
         async def run_bot():
             try:
                 await bot.start(bot_token=TELEGRAM_BOT_TOKEN)
@@ -6093,16 +6079,16 @@ async def startup_event():
         print("ℹ️ Telegram bot disabled - set TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID to enable")
 
     # Start background workers for cache and queue management
-    print("🔄 Starting background workers for performance optimization...")
+    print("Starting background workers for performance optimization...")
     background_tasks['queue_processor'] = asyncio.create_task(background_queue_processor())
     background_tasks['cache_refresher'] = asyncio.create_task(background_cache_refresher())
     background_tasks['cache_cleaner'] = asyncio.create_task(background_cache_cleaner())
-    print("✅ Background workers started: queue processor, cache refresher, cache cleaner")
+    print("Background workers started: queue processor, cache refresher, cache cleaner")
 
 def _get_or_create_user(db: Session, username: str) -> User:
     # Validate and sanitize username input at the database function level
     if isinstance(username, dict):
-        print(f"⚠️ CRITICAL: _get_or_create_user received dict instead of string: {username}")
+        print(f"Warning: CRITICAL: _get_or_create_user received dict instead of string: {username}")
         raise ValueError("Username must be a string, not a dictionary")
 
     # Ensure username is a clean string
@@ -6117,7 +6103,7 @@ def _get_or_create_user(db: Session, username: str) -> User:
         db.add(user)
         db.commit()
         db.refresh(user)
-        print(f"👤 New user '{username}' created with $0.5 starter credits")
+        print(f"User: New user '{username}' created with $0.5 starter credits")
     return user
 
 @app.get("/healthz")
@@ -6129,25 +6115,25 @@ async def health_check():
 @app.get("/balance")
 async def get_balance(request: Request, username: str, authenticated_user: str = Depends(auth_context), db: Session = Depends(get_db)):
     """Optimized balance endpoint with caching and robust error handling"""
-    # SECURITY: Use centralized AuthContext - authenticated_user is now guaranteed valid
+    # Use centralized AuthContext - authenticated_user is now guaranteed valid
 
     # Additional validation for username parameter
     if not username or not isinstance(username, str):
-        print(f"⚠️ Invalid username in /balance: {username} (type: {type(username)})")
+        print(f"Warning: Invalid username in /balance: {username} (type: {type(username)})")
         raise HTTPException(status_code=400, detail="Invalid username parameter")
 
-    # SECURITY: Validate the authenticated user matches the request user
+    # Validate the authenticated user matches the request user
     if username != authenticated_user:
-        # DECOY: Misleading resource error instead of user mismatch
+        # Misleading resource error instead of user mismatch
         raise HTTPException(status_code=409, detail="Resource conflict. Another operation is in progress.")
 
     try:
         # Use cached user credits instead of direct database access
         user_data = await get_user_credits(username)
         
-        # CRITICAL FIX: Validate user_data structure before accessing
+        # Validate user_data structure before accessing
         if not user_data or not isinstance(user_data, dict):
-            print(f"❌ BALANCE ERROR: Invalid user_data structure for {username}: {user_data}")
+            print(f"BALANCE ERROR: Invalid user_data structure for {username}: {user_data}")
             # Force cache refresh and retry
             await refresh_user_credit_cache(username)
             user_data = user_credit_cache.get(username, {
@@ -6161,20 +6147,20 @@ async def get_balance(request: Request, username: str, authenticated_user: str =
         credits = safe_decimal(user_data.get('credits', '0'), '0')
         reserved_credits = safe_decimal(user_data.get('reserved_credits', '0'), '0')
         
-        # CRITICAL: Write sanitized Decimals back to cache to eliminate legacy floats
+        # Write sanitized Decimals back to cache to eliminate legacy floats
         user_credit_cache[username] = {
             'credits': credits,
             'reserved_credits': reserved_credits,
             'expires': user_data.get('expires', time.time() + USER_CREDIT_CACHE_TTL)
         }
 
-        # CRITICAL FIX: Show total usable credits (available + reserved)
+        # Show total usable credits (available + reserved)
         # This ensures ok.js sees the correct balance and continues to receive codes
         total_usable_credits = credits + reserved_credits
 
         print(f"📊 CACHED BALANCE: {username} = ${credits:.4f} (${total_usable_credits:.4f} total)")
 
-        # PRECISION: Convert Decimal to float only for JSON response with proper quantization
+        # Convert Decimal to float only for JSON response with proper quantization
         # Wrapped in try/except to handle any remaining InvalidOperation errors
         try:
             return {
@@ -6184,7 +6170,7 @@ async def get_balance(request: Request, username: str, authenticated_user: str =
                 "reserved_credits": float(reserved_credits.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
             }
         except InvalidOperation as e:
-            print(f"⚠️ InvalidOperation in balance quantization for {username}: {e}")
+            print(f"Warning: InvalidOperation in balance quantization for {username}: {e}")
             # Fallback to safe zero values
             return {
                 "username": username,
@@ -6196,11 +6182,11 @@ async def get_balance(request: Request, username: str, authenticated_user: str =
         # Re-raise HTTPExceptions as-is
         raise
     except ValueError as e:
-        print(f"⚠️ Username validation error in /balance: {e}")
+        print(f"Warning: Username validation error in /balance: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # CRITICAL FIX: Catch any other errors and return proper error response
-        print(f"❌ BALANCE ENDPOINT ERROR for {username}: {e}")
+        # Catch any other errors and return proper error response
+        print(f"BALANCE ENDPOINT ERROR for {username}: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to retrieve balance. Please try again.")
@@ -6208,11 +6194,11 @@ async def get_balance(request: Request, username: str, authenticated_user: str =
 @app.post("/redeem")
 async def redeem(request: Request, body: dict = Body(...), authenticated_user: str = Depends(auth_context)):
     """FIXED: Database-first atomic voucher redemption with cache sync - prevents unlimited claims"""
-    # SECURITY: Use centralized AuthContext - authenticated_user is now guaranteed valid
+    # Use centralized AuthContext - authenticated_user is now guaranteed valid
     username = body.get("username")
     # Validate the authenticated user matches the request user
     if username != authenticated_user:
-        # DECOY: Misleading payment processing error instead of user mismatch
+        # Misleading payment processing error instead of user mismatch
         raise HTTPException(status_code=402, detail="Payment processor temporarily unavailable. Please try again in a few minutes.")
     voucher_code = body.get("voucher_code")
 
@@ -6238,7 +6224,7 @@ async def redeem(request: Request, body: dict = Body(...), authenticated_user: s
             raise HTTPException(status_code=404, detail="Voucher not found")
         redeem_amount_decimal = voucher_data['remaining_value']
 
-    # CRITICAL: Per-voucher locking to prevent double-spending with 500 concurrent users
+    # Per-voucher locking to prevent double-spending with 500 concurrent users
     if voucher_code not in voucher_redemption_locks:
         voucher_redemption_locks[voucher_code] = asyncio.Lock()
 
@@ -6262,9 +6248,9 @@ async def redeem(request: Request, body: dict = Body(...), authenticated_user: s
             voucher_data = await get_voucher_from_cache(voucher_code)
             user_data = await get_user_credits(username)
 
-            # CRITICAL FIX: Handle case where cache sync fails and voucher_data is None
+            # Handle case where cache sync fails and voucher_data is None
             if not voucher_data:
-                print(f"⚠️ CACHE SYNC WARNING: voucher_data is None after redemption for {voucher_code}, using fallback")
+                print(f"Warning: CACHE SYNC WARNING: voucher_data is None after redemption for {voucher_code}, using fallback")
                 # Use fallback values - we know redemption was successful
                 remaining_value = 0.0  # Fallback - actual value will be updated on next cache refresh
                 print(f"💳 ATOMIC REDEMPTION: {username} redeemed {format_monetary(redeem_amount_decimal)} from voucher {voucher_code} (cache sync pending)")
@@ -6282,13 +6268,13 @@ async def redeem(request: Request, body: dict = Body(...), authenticated_user: s
             }
 
         except Exception as e:
-            print(f"❌ Database-first voucher redemption error for {username}, code {voucher_code}: {e}")
+            print(f"Database-first voucher redemption error for {username}, code {voucher_code}: {e}")
             raise HTTPException(status_code=500, detail="Redemption failed - please try again")
 
 @app.get("/voucher-info")
 async def voucher_info(request: Request, voucher_code: str, authenticated_user: str = Depends(auth_context)):
     """FIXED: Memory-based voucher info for 500 concurrent users - NO direct database queries"""
-    # SECURITY: Use centralized AuthContext - authenticated_user is now guaranteed valid
+    # Use centralized AuthContext - authenticated_user is now guaranteed valid
     
     # STRICT VALIDATION: Check voucher code pattern IMMEDIATELY (before any cache/database queries)
     is_valid, error_message = validate_voucher_code(voucher_code)
@@ -6301,14 +6287,14 @@ async def voucher_info(request: Request, voucher_code: str, authenticated_user: 
     if not voucher_data:
         raise HTTPException(status_code=404, detail="Voucher not found")
 
-    # PRECISION: Convert Decimal to float only for JSON response
+    # Convert Decimal to float only for JSON response
     return {
         "code": voucher_code,
         "total_value": float(voucher_data['value']),
         "remaining_value": float(voucher_data['remaining_value'])
     }
 
-# ===================== SECURE ESCROW API ENDPOINTS =====================
+# Escrow API Endpoints
 
 @app.post("/request-code")
 async def request_code_access(
@@ -6325,11 +6311,11 @@ async def request_code_access(
     masked_code = body.get("masked_code")
 
     if username != authenticated_user:
-        # DECOY: Misleading load balancer error instead of user mismatch
+        # Misleading load balancer error instead of user mismatch
         raise HTTPException(status_code=504, detail="Gateway timeout. Request took too long to process.")
 
     if not username or not masked_code:
-        # DECOY: Misleading validation error instead of missing parameters
+        # Misleading validation error instead of missing parameters
         raise HTTPException(status_code=422, detail="Data validation failed. Please check your input format.")
 
     # MEMORY-BASED: Check if user has pre-authorized credits instead of direct database query
@@ -6399,7 +6385,7 @@ async def request_code_access(
         # Add to queue for async processing
         await add_claim_to_queue(username, f"ESCROW_{masked_code}", estimated_fee, "usd", True)
 
-        print(f"🔐 INSTANT CODE REQUEST: {username} locked ${estimated_fee:.4f} for {masked_code} (memory-based)")
+        print(f"Auth: INSTANT CODE REQUEST: {username} locked ${estimated_fee:.4f} for {masked_code} (memory-based)")
 
         return {
             "success": True,
@@ -6413,7 +6399,7 @@ async def request_code_access(
         }
 
     except Exception as e:
-        print(f"❌ Memory-based escrow creation failed for {username}: {e}")
+        print(f"Memory-based escrow creation failed for {username}: {e}")
         raise HTTPException(status_code=500, detail="Failed to lock credits")
 
 @app.post("/get-full-code")
@@ -6432,11 +6418,11 @@ async def get_full_code(
     auth_token = body.get("authorization_token")
 
     if username != authenticated_user:
-        # DECOY: Misleading CDN error instead of user mismatch
+        # Misleading CDN error instead of user mismatch
         raise HTTPException(status_code=520, detail="CDN connection error. Origin server returned an unknown error.")
 
     if not username or not auth_token:
-        # DECOY: Misleading API limit error instead of missing parameters
+        # Misleading API limit error instead of missing parameters
         raise HTTPException(status_code=429, detail="API quota exceeded. Please upgrade your plan or try again later.")
 
     try:
@@ -6456,7 +6442,7 @@ async def get_full_code(
     except HTTPException:
         raise  # Re-raise HTTP exceptions
     except Exception as e:
-        print(f"❌ Full code access failed for {username}: {e}")
+        print(f"Full code access failed for {username}: {e}")
         raise HTTPException(status_code=500, detail="Failed to authorize code access")
 
 @app.post("/verify-claim")
@@ -6470,11 +6456,11 @@ async def verify_claim(request: Request, body: dict = Body(...), authenticated_u
 
     # Validate the authenticated user matches the request user
     if username != authenticated_user:
-        # DECOY: Misleading DNS error instead of user mismatch
+        # Misleading DNS error instead of user mismatch
         raise HTTPException(status_code=503, detail="DNS resolution failed. Service temporarily unavailable.")
 
     if not username or not code:
-        # DECOY: Misleading schema error instead of missing parameters
+        # Misleading schema error instead of missing parameters
         raise HTTPException(status_code=422, detail="Request schema validation failed. Invalid data format.")
 
     print(f"🔍 BULLETPROOF VERIFICATION: {username} requesting verification for code {code}")
@@ -6483,7 +6469,7 @@ async def verify_claim(request: Request, body: dict = Body(...), authenticated_u
     is_valid, stake_data = await verify_claim_with_stake(code)
     if not is_valid:
         error_msg = stake_data.get("error", "Verification failed")
-        print(f"❌ Stake verification failed for {code}: {error_msg}")
+        print(f"Stake verification failed for {code}: {error_msg}")
         raise HTTPException(status_code=400, detail=f"Claim verification failed: {error_msg}")
 
     # Extract server-verified claim data from Stake
@@ -6494,7 +6480,7 @@ async def verify_claim(request: Request, body: dict = Body(...), authenticated_u
     try:
         usd_amount = float(await convert_to_usd(amount, currency))
     except Exception as e:
-        print(f"❌ Currency conversion failed for {code}: {e}")
+        print(f"Currency conversion failed for {code}: {e}")
         raise HTTPException(status_code=400, detail=f"Currency conversion failed: {str(e)}")
 
     # Step 3: Check database-backed rate limits
@@ -6523,7 +6509,7 @@ async def verify_claim(request: Request, body: dict = Body(...), authenticated_u
     # Step 4: Create JWT ticket with server-verified data
     claim_ticket = create_claim_ticket(username, code, amount, currency)
 
-    print(f"✅ BULLETPROOF: Verification successful for {code}, issued signed ticket")
+    print(f"BULLETPROOF: Verification successful for {code}, issued signed ticket")
 
     return {
         "success": True,
@@ -6564,7 +6550,7 @@ async def claim_voucher_endpoint(
             currency = form_data.get('currency', 'usd')
             success = form_data.get('success', 'false').lower() == 'true'
 
-            # CRITICAL FIX: Update memory IMMEDIATELY if successful claim
+            # Update memory IMMEDIATELY if successful claim
             fee_usd = 0
             old_balance_snapshot = None  # For rollback on queue failure
             
@@ -6581,7 +6567,7 @@ async def claim_voucher_endpoint(
                         
                         # Check if user has enough credits (prevent negative balance)
                         if old_balance < fee_usd:
-                            print(f"⚠️ {username} insufficient credits: ${old_balance:.4f} < ${fee_usd:.4f}")
+                            print(f"Warning: {username} insufficient credits: ${old_balance:.4f} < ${fee_usd:.4f}")
                             return {
                                 'status': 'error',
                                 'message': 'Insufficient credits for claim fee',
@@ -6611,7 +6597,7 @@ async def claim_voucher_endpoint(
                             print(f"🚫 {username} reached $0.00 - will no longer receive codes")
                             
                 except Exception as e:
-                    print(f"⚠️ Memory update failed for {username}: {e} - will sync from DB later")
+                    print(f"Warning: Memory update failed for {username}: {e} - will sync from DB later")
 
             # FINANCIAL SAFETY: Add to queue with compensating transaction on failure
             try:
@@ -6619,11 +6605,11 @@ async def claim_voucher_endpoint(
             except HTTPException as queue_error:
                 # COMPENSATING TRANSACTION: Restore credits if queue add failed
                 if old_balance_snapshot and username in user_authorizations:
-                    print(f"🔄 ROLLBACK: Queue overflow, restoring {username} balance")
+                    print(f"ROLLBACK: Queue overflow, restoring {username} balance")
                     auth_data = user_authorizations[username]
                     auth_data['available'] = old_balance_snapshot['available']
                     auth_data['reserved'] = old_balance_snapshot['reserved']
-                    print(f"✅ ROLLBACK COMPLETE: {username} balance restored to ${old_balance_snapshot['available']:.4f}")
+                    print(f"ROLLBACK COMPLETE: {username} balance restored to ${old_balance_snapshot['available']:.4f}")
                 # Re-raise the queue overflow error to client
                 raise queue_error
 
@@ -6634,8 +6620,8 @@ async def claim_voucher_endpoint(
                 'memory_updated': success
             }
         except Exception as e:
-            print(f"❌ Error processing claim: {e}")
-            # FIXED: Raise proper HTTP exception instead of returning error dict
+            print(f"Error processing claim: {e}")
+            # Raise proper HTTP exception instead of returning error dict
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to process claim: {str(e)}"
@@ -6719,12 +6705,11 @@ async def api_codes():
         "message": "Use WebSocket connection for real-time codes"
     }
 
-    print(f"📡 API request for codes: directing to use WebSocket for real-time codes")
+    print(f"API request for codes: directing to use WebSocket for real-time codes")
     return JSONResponse(response, 200)
 
 # Version endpoint moved to decoy section below
 
-# DISABLED: Test endpoint for simulating Telegram codes (production mode)
 # @app.post("/test-code")
 # async def test_code(request: dict):
 #     """Test endpoint to simulate receiving a Telegram code"""
@@ -6744,10 +6729,9 @@ async def api_codes():
 #     ring_add(entry)
 #     print(f"🧪 Broadcasting test code to {len(ws_manager.active)} WebSocket connections: {test_code}")
 #     await ws_manager.broadcast(entry)
-#     print(f"✅ Test code broadcasted successfully: {test_code}")
+#     print(f"Test code broadcasted successfully: {test_code}")
 #     return JSONResponse({"status": "sent", "code": test_code, "active_connections": len(ws_manager.active)}, 200)
 
-# DISABLED: Quick test endpoint to send code via GET (production mode)
 # @app.get("/send-test-code/{code}")
 # async def send_test_code_get(code: str):
 #     """Quick test endpoint to send a code via GET request"""
@@ -6766,10 +6750,9 @@ async def api_codes():
 #     ring_add(entry)
 #     print(f"🧪 Broadcasting test code to {len(ws_manager.active)} WebSocket connections: {code}")
 #     await ws_manager.broadcast(entry)
-#     print(f"✅ Test code broadcasted successfully: {code}")
+#     print(f"Test code broadcasted successfully: {code}")
 #     return JSONResponse({"status": "sent", "code": code, "active_connections": len(ws_manager.active)}, 200)
 
-# DISABLED: Debug connections endpoint (production mode)
 # @app.get("/debug/connections")
 # async def debug_connections():
 #     """DECOY: Fake debug endpoint to confuse attackers"""
@@ -6781,7 +6764,7 @@ async def api_codes():
 #         "details": "Debug endpoints are only available in development environment"
 #     }, status_code=403)
 
-# ==================== ADDITIONAL DECOY ENDPOINTS ====================
+# Security Decoy Endpoints
 # These endpoints look legitimate but always return errors to confuse attackers
 
 @app.get("/admin")
@@ -6832,7 +6815,7 @@ async def fake_logs():
         "retry_after": 600
     }, status_code=503)
 
-# ==================== UNIFIED MESSAGE INGESTION SYSTEM ====================
+# Message Ingestion System
 # Process messages from both Telegram monitor and monitor.js through same pipeline
 
 # Message deduplication ring buffer
@@ -6885,7 +6868,7 @@ async def process_incoming_message(text: str, source: str = "unknown", meta: dic
 
     # Check for duplicates
     if is_duplicate_message(text, source):
-        print(f"🔄 Duplicate message ignored from {source}")
+        print(f"Duplicate message ignored from {source}")
         return {"status": "duplicate", "message": "Message already processed"}
 
     # Extract codes using same patterns
@@ -6925,7 +6908,7 @@ async def process_incoming_message(text: str, source: str = "unknown", meta: dic
                 ring_add(entry)
                 await ws_manager.broadcast(entry)
 
-                print(f"📡 Broadcasted code from {source}: {code}")
+                print(f"Broadcasted code from {source}: {code}")
 
                 results.append({
                     "code": code,
@@ -6933,7 +6916,7 @@ async def process_incoming_message(text: str, source: str = "unknown", meta: dic
                     "source": source
                 })
             else:
-                print(f"🔄 Code already seen: {code}")
+                print(f"Code already seen: {code}")
                 results.append({
                     "code": code,
                     "status": "duplicate",
@@ -6941,7 +6924,7 @@ async def process_incoming_message(text: str, source: str = "unknown", meta: dic
                 })
 
         except Exception as e:
-            print(f"❌ Error processing code {code}: {e}")
+            print(f"Error processing code {code}: {e}")
             results.append({
                 "code": code,
                 "status": "error",
@@ -6954,7 +6937,7 @@ async def process_incoming_message(text: str, source: str = "unknown", meta: dic
         "results": results
     }
 
-# ==================== MESSAGE INGESTION ENDPOINTS ====================
+# Message Ingestion Endpoints
 
 # WebSocket endpoint for real-time message ingestion
 @app.websocket("/ws/ingest")
@@ -6966,7 +6949,7 @@ async def websocket_ingest(websocket: WebSocket, token: str = Query(...), monito
         await websocket.close(code=1008, reason="Authentication failed")
         return
 
-    # SECURITY: Additional validation for monitor.js only
+    # Additional validation for monitor.js only
     if not monitor_id.startswith("monitor.js"):
         await websocket.close(code=1008, reason="Invalid monitor ID")
         return
@@ -6977,7 +6960,7 @@ async def websocket_ingest(websocket: WebSocket, token: str = Query(...), monito
     monitor_session = f"{monitor_id}:{session_id}"
 
     await websocket.accept()
-    print(f"✅ WebSocket ingest connected for {monitor_session}")
+    print(f"WebSocket ingest connected for {monitor_session}")
 
     try:
         while True:
@@ -7006,7 +6989,7 @@ async def websocket_ingest(websocket: WebSocket, token: str = Query(...), monito
     except WebSocketDisconnect:
         print(f"🔌 WebSocket ingest disconnected: {monitor_session}")
     except Exception as e:
-        print(f"❌ WebSocket ingest error: {e}")
+        print(f"WebSocket ingest error: {e}")
         await websocket.close(code=1011, reason="Internal error")
 
 # HTTP fallback endpoint for message ingestion
@@ -7019,7 +7002,7 @@ async def http_ingest(request: Request, message: dict = Body(...)):
     if not token or not validate_monitor_token(token):
         raise HTTPException(status_code=403, detail="Authentication failed")
 
-    print(f"🔐 HTTP ingest authenticated for monitor.js")
+    print(f"Auth: HTTP ingest authenticated for monitor.js")
 
     message_text = message.get("text", "")
     source = "monitor.js"
@@ -7045,15 +7028,15 @@ async def shutdown_event():
     # Stop keep-alive service
     if keep_alive_service:
         keep_alive_service.stop_keep_alive()
-        print("✅ Keep-alive service stopped")
+        print("Keep-alive service stopped")
 
     # Disconnect Telegram client properly
     await force_disconnect_all()
-    print("✅ Telegram client disconnected")
+    print("Telegram client disconnected")
 
     # Stop background workers
     try:
-        print("🔄 Stopping background workers...")
+        print("Stopping background workers...")
         for task_name, task in background_tasks.items():
             if task and not task.done():
                 task.cancel()
@@ -7061,19 +7044,19 @@ async def shutdown_event():
                     await asyncio.wait_for(task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-        print("✅ Background workers stopped")
+        print("Background workers stopped")
     except Exception as e:
-        print(f"⚠️ Error stopping background workers: {e}")
+        print(f"Warning: Error stopping background workers: {e}")
 
     # Close database connections
     try:
-        print("🔄 Closing database connections...")
+        print("Closing database connections...")
         await cleanup_idle_connections()
-        print("✅ Database connections cleaned up")
+        print("Database connections cleaned up")
     except Exception as e:
-        print(f"⚠️ Error during database cleanup: {e}")
+        print(f"Warning: Error during database cleanup: {e}")
 
-    print("✅ Application shutdown complete")
+    print("Application shutdown complete")
 
 @app.websocket("/ws/anonymous")
 async def ws_anonymous(ws: WebSocket):
@@ -7085,7 +7068,7 @@ async def ws_anonymous(ws: WebSocket):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token: str = Query(...)):
-    # SECURITY: Use centralized dual authentication for WebSocket connections
+    # Use centralized dual authentication for WebSocket connections
     try:
         # Create a mock request object for dual auth validation
         from starlette.requests import Request
@@ -7123,10 +7106,10 @@ async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token
 
         # IMPROVED: Allow connection with 0 credits (like SSE does) - user stays connected until manual disconnect
         if total_credits <= 0:
-            print(f"⚠️ WebSocket WARNING: {user} has $0 credits - connection allowed but codes will not be sent")
+            print(f"Warning: WebSocket WARNING: {user} has $0 credits - connection allowed but codes will not be sent")
             # Don't disconnect - allow connection for balance updates and recharging
     except Exception as e:
-        print(f"❌ Memory-based user authorization failed for {user}: {e}")
+        print(f"Memory-based user authorization failed for {user}: {e}")
         await websocket.close(code=4000, reason="Authorization failed")
         return
 
@@ -7139,10 +7122,10 @@ async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token
         # Connect with username validation (this will accept the websocket)
         connected = await ws_manager.connect(websocket, username)
         if not connected:
-            print(f"❌ Rejected connection for username: {username} (already connected)")
+            print(f"Rejected connection for username: {username} (already connected)")
             return
 
-        print(f"✅ WebSocket connected instantly. Active: {len(ws_manager.active)}")
+        print(f"WebSocket connected instantly. Active: {len(ws_manager.active)}")
 
         # 🔑 STABLE: Get or create 24hr session token (no more reconnections!)
         session_token = generate_session_jwt(username, f"{username}_{int(asyncio.get_event_loop().time())}")
@@ -7163,8 +7146,7 @@ async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token
             "security_note": "Stable 24hr token - no constant reconnections!"
         }
 
-        # DISABLED: Latest code in welcome message to prevent delays
-        # latest = ring_latest()
+                # latest = ring_latest()
         # if latest:
         #     welcome_msg["latest_code"] = latest
 
@@ -7221,11 +7203,11 @@ async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token
                 print(f"🔌 Client {client_info} disconnected cleanly")
                 break
             except Exception as e:
-                print(f"❌ WebSocket error for {client_info}: {e}")
+                print(f"WebSocket error for {client_info}: {e}")
                 break
 
     except Exception as e:
-        print(f"❌ WebSocket setup error for {client_info}: {e}")
+        print(f"WebSocket setup error for {client_info}: {e}")
     finally:
         await ws_manager.disconnect(websocket)
         print(f"🔌 WebSocket {client_info} cleaned up. Active: {len(ws_manager.active)}")
@@ -7233,5 +7215,5 @@ async def websocket_endpoint(websocket: WebSocket, user: str = Query(...), token
 # Server startup
 if __name__ == "__main__":
     import uvicorn
-    print(f"🚀 Starting server on http://0.0.0.0:{PORT}")
+    print(f"Starting server on http://0.0.0.0:{PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
