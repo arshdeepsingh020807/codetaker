@@ -9,7 +9,7 @@ Key Features:
 - Telegram channel monitoring for promo codes using Telethon
 - Real-time code broadcasting via WebSocket/SSE to connected users
 - Credit-based access control with Decimal precision for financial calculations
-- High-performance caching system supporting 300+ concurrent users
+- High-performance caching system supporting concurrent users
 - Escrow system for secure code claiming
 - JWT-based authentication with session management
 - PostgreSQL/Supabase database with connection pooling
@@ -31,7 +31,7 @@ Performance Optimizations:
 import os, re, asyncio, random, string, json, time, httpx, threading
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
-from collections import deque
+from collections import deque, defaultdict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException, Body, Request, Form
 from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,8 @@ import hashlib
 import hmac
 import secrets
 import jwt
+import uuid
+import sqlite3
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from telethon import TelegramClient, events, functions
 from telethon.errors import SessionPasswordNeededError
@@ -85,6 +87,293 @@ processing_active = False
 cache_refresh_worker = None
 claim_queue_worker = None
 cache_cleanup_worker = None
+
+# ========================================
+# WAL (Write-Ahead Log) CREDIT DEDUCTION SYSTEM
+# ========================================
+# Bulletproof credit deduction with instant memory updates and durable logging
+# Prevents double-deduction, handles crashes, ensures financial accuracy
+
+# WAL Database - Durable append-only log for all credit operations
+WAL_DB_PATH = "credit_deductions.wal"
+wal_db_lock = threading.Lock()
+
+def init_wal_database():
+    """Initialize WAL database with idempotency guarantees"""
+    with sqlite3.connect(WAL_DB_PATH) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS deductions (
+                transaction_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                code TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                synced INTEGER DEFAULT 0,
+                sync_timestamp REAL,
+                idempotency_key TEXT UNIQUE NOT NULL,
+                created_at REAL NOT NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_username ON deductions(username)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_synced ON deductions(synced)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_idempotency ON deductions(idempotency_key)')
+        conn.commit()
+        print("WAL: Database initialized successfully")
+
+# Per-user locks to prevent race conditions during credit operations
+user_deduction_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# WAL metrics for monitoring
+wal_metrics = {
+    'total_deductions': 0,
+    'synced_deductions': 0,
+    'pending_deductions': 0,
+    'failed_syncs': 0,
+    'double_deduction_prevented': 0
+}
+
+async def wal_deduct_credits_instant(username: str, amount: Decimal, code: str) -> tuple[bool, str, str]:
+    """
+    INSTANT CREDIT DEDUCTION with bulletproof WAL logging
+    
+    Flow:
+    1. Generate unique transaction ID
+    2. Check idempotency (prevent double deduction)
+    3. Write to durable WAL log FIRST
+    4. Update memory cache SECOND
+    5. Queue background sync to main DB
+    
+    Returns: (success, message, transaction_id)
+    """
+    import time
+    
+    # Generate unique transaction ID
+    transaction_id = str(uuid.uuid4())
+    current_time = time.time()
+    
+    # Create idempotency key: username + code + rounded_timestamp (prevents same code double-deduction within 1 second)
+    idempotency_key = f"{username}:{code}:{int(current_time)}"
+    
+    # Acquire per-user lock to prevent race conditions
+    async with user_deduction_locks[username]:
+        try:
+            # STEP 1: Check if this exact deduction already exists (idempotency)
+            with wal_db_lock:
+                with sqlite3.connect(WAL_DB_PATH) as conn:
+                    existing = conn.execute(
+                        "SELECT transaction_id FROM deductions WHERE idempotency_key = ?",
+                        (idempotency_key,)
+                    ).fetchone()
+                    
+                    if existing:
+                        wal_metrics['double_deduction_prevented'] += 1
+                        print(f"WAL: PREVENTED DOUBLE DEDUCTION for {username} on code {code} (existing tx: {existing[0]})")
+                        return (False, "Deduction already processed (idempotency protection)", existing[0])
+            
+            # STEP 2: Verify user has sufficient credits in memory cache
+            current_credits = credit_cache.get(username, Decimal('0'))
+            if current_credits < amount:
+                return (False, f"Insufficient credits: {current_credits} < {amount}", transaction_id)
+            
+            # STEP 3: Write to WAL FIRST (durable, crash-safe)
+            with wal_db_lock:
+                with sqlite3.connect(WAL_DB_PATH) as conn:
+                    conn.execute('''
+                        INSERT INTO deductions 
+                        (transaction_id, username, amount, code, timestamp, idempotency_key, created_at, synced)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                    ''', (
+                        transaction_id,
+                        username,
+                        str(amount),
+                        code,
+                        current_time,
+                        idempotency_key,
+                        current_time
+                    ))
+                    conn.commit()
+            
+            # STEP 4: Update memory cache AFTER WAL write (instant for user)
+            credit_cache[username] = current_credits - amount
+            credit_cache_last_update[username] = current_time
+            
+            # STEP 5: Queue background sync to main database (non-blocking)
+            asyncio.create_task(wal_sync_to_main_db(transaction_id, username, amount))
+            
+            # Update metrics
+            wal_metrics['total_deductions'] += 1
+            wal_metrics['pending_deductions'] += 1
+            
+            print(f"WAL: ✅ Deducted {amount} from {username} for code {code} (tx: {transaction_id[:8]}..., cache: {credit_cache[username]})")
+            return (True, "Credits deducted successfully", transaction_id)
+            
+        except Exception as e:
+            print(f"WAL: ❌ CRITICAL ERROR during deduction for {username}: {e}")
+            return (False, f"Deduction failed: {str(e)}", transaction_id)
+
+async def wal_sync_to_main_db(transaction_id: str, username: str, amount: Decimal):
+    """
+    Background sync from WAL to main PostgreSQL database
+    SIMPLIFIED: Deducts directly from credits (no reserved_credits needed)
+    Handles failures gracefully, retries on errors
+    """
+    import time
+    max_retries = 3
+    retry_delay = 1
+    
+    for attempt in range(max_retries):
+        try:
+            # SIMPLIFIED: Deduct directly from credits with atomic conditional check
+            with SessionLocal() as db:
+                result = db.execute(
+                    text("UPDATE users SET credits = credits - :amount WHERE username = :username AND credits >= :amount"),
+                    {"amount": float(amount), "username": username}
+                )
+                
+                if result.rowcount == 0:
+                    print(f"WAL: WARNING - User {username} insufficient credits for tx {transaction_id[:8]}")
+                    # Check if user exists
+                    user_exists = db.execute(
+                        text("SELECT credits FROM users WHERE username = :username"),
+                        {"username": username}
+                    ).fetchone()
+                    
+                    if not user_exists:
+                        print(f"WAL: ERROR - User {username} not found for tx {transaction_id[:8]}")
+                        # Cannot proceed - user doesn't exist
+                        db.rollback()
+                        return False
+                    else:
+                        print(f"WAL: ERROR - User {username} has insufficient credits (has: {user_exists[0]}, needs: {amount})")
+                        db.rollback()
+                        return False
+                
+                db.commit()
+            
+            # Mark as synced in WAL
+            with wal_db_lock:
+                with sqlite3.connect(WAL_DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE deductions SET synced = 1, sync_timestamp = ? WHERE transaction_id = ?",
+                        (time.time(), transaction_id)
+                    )
+                    conn.commit()
+            
+            # Update metrics
+            wal_metrics['synced_deductions'] += 1
+            wal_metrics['pending_deductions'] -= 1
+            
+            print(f"WAL: 💾 Synced to main DB - {username} -{amount} (tx: {transaction_id[:8]})")
+            return True
+            
+        except Exception as e:
+            print(f"WAL: ⚠️ Sync failed (attempt {attempt + 1}/{max_retries}) for tx {transaction_id[:8]}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+            else:
+                wal_metrics['failed_syncs'] += 1
+                print(f"WAL: ❌ SYNC FAILED after {max_retries} attempts for tx {transaction_id[:8]} - will retry on next startup")
+                return False
+
+async def wal_crash_recovery():
+    """
+    Crash recovery: Replay all unsynced deductions on startup
+    Ensures no credit deductions are lost due to crashes
+    """
+    print("WAL: Starting crash recovery - checking for unsynced deductions...")
+    
+    try:
+        # Get all unsynced deductions from WAL
+        with wal_db_lock:
+            with sqlite3.connect(WAL_DB_PATH) as conn:
+                unsynced = conn.execute(
+                    "SELECT transaction_id, username, amount, code, timestamp FROM deductions WHERE synced = 0 ORDER BY created_at ASC"
+                ).fetchall()
+        
+        if not unsynced:
+            print("WAL: ✅ No unsynced deductions found - system was properly shutdown")
+            return
+        
+        print(f"WAL: Found {len(unsynced)} unsynced deductions - replaying to main database...")
+        recovered_count = 0
+        
+        for tx_id, username, amount_str, code, timestamp in unsynced:
+            amount = Decimal(amount_str)
+            
+            try:
+                # SIMPLIFIED: Deduct directly from credits with atomic conditional check
+                with SessionLocal() as db:
+                    result = db.execute(
+                        text("UPDATE users SET credits = credits - :amount WHERE username = :username AND credits >= :amount"),
+                        {"amount": float(amount), "username": username}
+                    )
+                    
+                    if result.rowcount == 0:
+                        print(f"WAL: RECOVERY FAILED for tx {tx_id[:8]} - User {username} has insufficient credits")
+                        continue  # Skip this transaction, will retry on next startup
+                    
+                    db.commit()
+                
+                # Mark as synced
+                with wal_db_lock:
+                    with sqlite3.connect(WAL_DB_PATH) as conn:
+                        conn.execute(
+                            "UPDATE deductions SET synced = 1, sync_timestamp = ? WHERE transaction_id = ?",
+                            (time.time(), tx_id)
+                        )
+                        conn.commit()
+                
+                recovered_count += 1
+                print(f"WAL: ✅ Recovered tx {tx_id[:8]} - {username} -{amount}")
+                
+            except Exception as e:
+                print(f"WAL: ❌ Failed to recover tx {tx_id[:8]}: {e}")
+        
+        print(f"WAL: Crash recovery complete - recovered {recovered_count}/{len(unsynced)} deductions")
+        
+    except Exception as e:
+        print(f"WAL: ❌ CRITICAL ERROR during crash recovery: {e}")
+
+async def wal_reconciliation_check():
+    """
+    Periodic reconciliation: Verify WAL and main DB are in sync
+    Detects and fixes any discrepancies
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            
+            print("WAL: Running reconciliation check...")
+            
+            # Get pending deductions count
+            with wal_db_lock:
+                with sqlite3.connect(WAL_DB_PATH) as conn:
+                    pending = conn.execute(
+                        "SELECT COUNT(*) FROM deductions WHERE synced = 0"
+                    ).fetchone()[0]
+            
+            if pending > 0:
+                print(f"WAL: ⚠️ Found {pending} pending deductions - triggering sync")
+                
+                # Get unsynced transactions
+                with wal_db_lock:
+                    with sqlite3.connect(WAL_DB_PATH) as conn:
+                        unsynced = conn.execute(
+                            "SELECT transaction_id, username, amount FROM deductions WHERE synced = 0 LIMIT 100"
+                        ).fetchall()
+                
+                # Sync them
+                for tx_id, username, amount_str in unsynced:
+                    asyncio.create_task(wal_sync_to_main_db(tx_id, username, Decimal(amount_str)))
+            else:
+                print(f"WAL: ✅ All deductions in sync (metrics: {wal_metrics})")
+                
+        except Exception as e:
+            print(f"WAL: Reconciliation error: {e}")
+            await asyncio.sleep(60)
+
+# Initialize WAL database on module load
+init_wal_database()
 
 
 PORT = int(os.getenv("PORT", "5000"))
@@ -136,7 +425,7 @@ RING_SIZE = int(os.getenv("RING_SIZE", "100"))
 # Keep-alive configuration
 PRODUCTION_URL = os.getenv("PRODUCTION_URL", "https://kciade.online")
 KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "5"))  # minutes
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "4"))  # minutes (UptimeRobot compatible: <5min)
 
 
 # Database Configuration
@@ -574,10 +863,13 @@ async def get_user_credits(username: str):
         }
 
 # Claim Processing Queue System
-async def add_claim_to_queue(username: str, code: str, amount: float, currency: str, success: bool):
+async def add_claim_to_queue(username: str, code: str, amount: float, currency: str, success: bool, usd_amount: Decimal = None):
     """
     CRITICAL: Add claim to queue with backpressure for financial safety
     Prevents silent data loss by rejecting when queue is near capacity
+    
+    Args:
+        usd_amount: USD value of claim for accurate fee calculation in batch processing
     """
     global claim_queue_overflow_count
     
@@ -602,6 +894,7 @@ async def add_claim_to_queue(username: str, code: str, amount: float, currency: 
         'amount': amount,
         'currency': currency,
         'success': success,
+        'usd_amount': float(usd_amount) if usd_amount else 0,  # CRITICAL: Store USD value for batch fee calculation
         'timestamp': datetime.utcnow()
     }
 
@@ -698,9 +991,25 @@ async def process_claim_batch(batch: list):
                             print(f"🚨 BLOCKED: {username} failed rate limit check for {code}")
                             continue
                         
-                        # Calculate individual fee (5% of claim amount) - PRECISION
-                        amount_decimal = safe_decimal(claim['amount'])
-                        fee_amount = (amount_decimal * Decimal('0.05')).quantize(
+                        # CRITICAL FIX: Always use USD amount for fee calculation (5% of USD value)
+                        # Recompute USD if missing to ensure correct fees
+                        usd_value = safe_decimal(claim.get('usd_amount', 0))
+                        if usd_value == 0:
+                            # SECURITY FIX: Recompute USD from crypto amount instead of using crypto directly
+                            # This prevents charging 5% of tiny crypto amounts (e.g., 0.00155 ETH)
+                            amount_decimal = safe_decimal(claim['amount'])
+                            currency = claim.get('currency', 'usd')
+                            try:
+                                # Recompute USD value to match instant deduction
+                                usd_value = await convert_to_usd(amount_decimal, currency)
+                                print(f"⚠️ Recomputed USD for {username}: {amount_decimal} {currency.upper()} = ${usd_value} USD")
+                            except Exception as e:
+                                print(f"❌ CRITICAL: Failed to compute USD for {username} {code}: {e}")
+                                # Skip this claim - cannot process without USD value
+                                continue
+                        
+                        # Always calculate fee as 5% of USD value
+                        fee_amount = (usd_value * Decimal('0.05')).quantize(
                             Decimal('0.00000001'), rounding=ROUND_HALF_UP
                         )
                         
@@ -733,11 +1042,11 @@ async def process_claim_batch(batch: list):
                         # Map fees by username in Python instead
                         result = db.execute(text(f"""
                             UPDATE users u 
-                            SET reserved_credits = u.reserved_credits - v.fee::numeric 
+                            SET credits = u.credits - v.fee::numeric 
                             FROM (VALUES {values_clause}) AS v(username, fee)
                             WHERE u.username = v.username 
-                            AND u.reserved_credits >= v.fee::numeric
-                            RETURNING u.id, u.username, u.reserved_credits
+                            AND u.credits >= v.fee::numeric
+                            RETURNING u.id, u.username, u.credits
                         """), params)
                     else:
                         # SQLite fallback: Process individually (no VALUES support)
@@ -745,10 +1054,10 @@ async def process_claim_batch(batch: list):
                         for username, fee in user_fee_map.items():
                             result = db.execute(text("""
                                 UPDATE users 
-                                SET reserved_credits = reserved_credits - :fee 
+                                SET credits = credits - :fee 
                                 WHERE username = :username 
-                                AND reserved_credits >= :fee
-                                RETURNING id, username, reserved_credits
+                                AND credits >= :fee
+                                RETURNING id, username, credits
                             """), {'username': username, 'fee': fee})
                             row = result.fetchone()
                             if row:
@@ -936,11 +1245,11 @@ async def update_voucher_atomic(username: str, voucher_code: str, redeem_amount:
 
             voucher_id, new_remaining_value, voucher_value = voucher_result
 
-            # STEP 4: Add redemption amount to user reserved_credits (since user is connected)
-            # Add to reserved_credits so it's immediately available for fee deductions
+            # STEP 4: Add redemption amount to user credits
+            # Credits are immediately available for fee deductions via cache
             db.execute(text("""
                 UPDATE users 
-                SET reserved_credits = reserved_credits + :redeem_amount 
+                SET credits = credits + :redeem_amount 
                 WHERE id = :user_id
             """), {
                 'user_id': user.id,
@@ -1518,9 +1827,9 @@ async def process_advanced_claim_batch(code: str, usd_value: Decimal, db: Sessio
             result = db.execute(
                 text("""
                     UPDATE users 
-                    SET reserved_credits = reserved_credits - :amount 
+                    SET credits = credits - :amount 
                     WHERE id = ANY(:user_ids) 
-                    AND reserved_credits >= :amount
+                    AND credits >= :amount
                     RETURNING id, username
                 """),
                 {"amount": fee_amount_usdt, "user_ids": user_ids}
@@ -1739,14 +2048,11 @@ async def process_claim_batch_optimized(code: str, first_claim_data: dict, db: S
                     # SECURITY FIX: Keep as Decimal for precise monetary arithmetic (no float conversion)
                     fee_amount_usdt = fee_per_user_usdt.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)
 
-                    # ATOMIC: Try to deduct from reserved credits first
-                    result = db.execute(
-                        text("UPDATE users SET reserved_credits = reserved_credits - :amount WHERE id = :user_id AND reserved_credits >= :amount"),
-                        {"amount": fee_amount_usdt, "user_id": user.id}
-                    )
+                    # 🔥 WAL SYSTEM: Instant deduction with crash-safe logging
+                    success, message, tx_id = await wal_deduct_credits_instant(username, fee_amount_usdt, code)
 
                     # Only create records if deduction was successful
-                    if result.rowcount > 0:
+                    if success:
                         # Successful deduction - create batch item and prepare transaction
                         batch_item = ClaimBatchItem(
                             batch_id=new_batch.id,
@@ -2003,6 +2309,10 @@ async def convert_to_usd(amount: Decimal, currency: str) -> Decimal:
     Returns USD amount as Decimal for precise calculation
     """
     try:
+        # CRITICAL FIX: Ensure amount is Decimal (handles both float and Decimal inputs)
+        if not isinstance(amount, Decimal):
+            amount = Decimal(str(amount))
+        
         if amount <= 0:
             return Decimal('0')
 
@@ -2200,44 +2510,8 @@ def migrate_escrow_table():
 
 migrate_escrow_table()
 
-def startup_reconciliation():
-    """🛡️ CRASH RECOVERY: Release stranded reserved credits after server restart"""
-    try:
-        db = SessionLocal()
-
-        # Find all users with reserved credits (potential stranded funds)
-        users_with_reserves = db.query(User).filter(User.reserved_credits > 0).all()
-
-        if users_with_reserves:
-            print(f"STARTUP RECONCILIATION: Found {len(users_with_reserves)} users with reserved credits")
-
-            total_released = Decimal('0.0')
-            for user in users_with_reserves:
-                reserved_amount = user.reserved_credits
-
-                # ATOMIC: Release reserved credits back to available balance
-                db.execute(
-                    text("UPDATE users SET credits = credits + reserved_credits, reserved_credits = 0.0 WHERE id = :user_id"),
-                    {"user_id": user.id}
-                )
-
-                total_released += Decimal(str(reserved_amount))
-                print(f"RELEASED: {user.username} - ${reserved_amount} back to available credits")
-
-            db.commit()
-            print(f"STARTUP RECONCILIATION COMPLETED: Released ${total_released:.2f} total stranded credits")
-        else:
-            print("STARTUP RECONCILIATION: No stranded reserved credits found")
-
-        db.close()
-
-    except Exception as e:
-        print(f"STARTUP RECONCILIATION FAILED: {e}")
-        if 'db' in locals():
-            db.rollback()
-            db.close()
-
-# ⚠️ NOTE: Startup reconciliation will run via FastAPI startup handler
+# REMOVED: startup_reconciliation() - No longer needed with simplified credit system
+# WAL crash recovery handles all deduction replays without reconciliation conflicts
 
 async def verify_claim_with_stake(code: str) -> tuple[bool, dict]:
     """
@@ -3465,7 +3739,7 @@ async def _check_user_credits_db_async(username: str) -> float:
             db = SessionLocal()
             try:
                 user = db.query(User).filter(User.username == username).first()
-                total_credits = (user.credits + user.reserved_credits) if user else Decimal('0.0')
+                total_credits = user.credits if user else Decimal('0.0')
                 return total_credits
             finally:
                 db.close()
@@ -3479,12 +3753,12 @@ async def _check_user_credits_db_async(username: str) -> float:
         return 0.0
 
 def _check_user_credits_db(username: str) -> float:
-    """LEGACY SYNC: Direct database check for user credits - FIXED: Returns total usable credits (available + reserved)"""
+    """SIMPLIFIED: Direct database check for user credits"""
     try:
         db = SessionLocal()
         user = db.query(User).filter(User.username == username).first()
-        # Return total usable credits (available + reserved)
-        total_credits = (user.credits + user.reserved_credits) if user else Decimal('0.0')
+        # Return credits (no reserved_credits needed)
+        total_credits = user.credits if user else Decimal('0.0')
         db.close()
         return total_credits
     except Exception as e:
@@ -3496,74 +3770,41 @@ def _check_user_credits(username: str) -> float:
     return _get_cached_credits(username)
 
 async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[object, float]:
-    """🚀 OPTIMIZED: Get/create user and preauthorize credits in SINGLE database transaction"""
+    """SIMPLIFIED: Get/create user and cache credits (no DB reservation needed)"""
     import time
     import asyncio
-    import functools
 
     def sync_operation():
         db = SessionLocal()
         try:
-            # Single query - get or create user
+            # Get or create user
             user = db.query(User).filter(User.username == username).first()
             if not user:
-                # Give new users $0.5 starter credits (consistent with _get_or_create_user)  
-                user = User(username=username, credits=Decimal('0.5'), reserved_credits=Decimal('0.0'))
+                # Give new users $0.5 starter credits
+                user = User(username=username, credits=Decimal('0.5'))
                 db.add(user)
                 db.commit()
-                print(f"User: New user '{username}' created with $0.5 starter credits (pre-authorization)")
+                print(f"User: New user '{username}' created with $0.5 starter credits")
                 db.refresh(user)
 
-            # Get current credits (not yet reserved) - all in same transaction
-            available_credits = user.credits
-            current_reserved = user.reserved_credits
-
-            if available_credits <= 0:
-                # User has no new credits to reserve
-                if current_reserved > 0:
-                    # User has previously reserved credits
-                    user_authorizations[username] = {
-                        'total_reserved': current_reserved,
-                        'connection_time': time.time(),
-                        'available': current_reserved,
-                        'reserved': current_reserved,
-                        'credits': Decimal('0.0'),
-                        'authorized_until': float('inf')
-                    }
-                    print(f"CONSOLIDATED: {username} using ${current_reserved} existing reserved credits")
-                else:
-                    print(f"🚫 CONSOLIDATED: {username} has $0 available and $0 reserved")
-
-                # Update cache
-                current_time = time.time()
-                credit_cache[username] = current_reserved
-                credit_cache_last_update[username] = current_time
-                return user, current_reserved
-
-            # 🚀 MAXIMUM SPEED: Reserve ALL available credits in single transaction
-            user.reserved_credits += available_credits  # Add to reserved
-            user.credits = Decimal('0.0')              # Move all to reserved
-            db.commit()
-
-            total_reserved = user.reserved_credits
+            # Get current credits - no reservation needed
+            current_credits = user.credits
             current_time = time.time()
 
-            # Track reservation for disconnection cleanup  
-            user_authorizations[username] = {
-                'total_reserved': total_reserved,
-                'connection_time': current_time,
-                'available': total_reserved,  # Credits available for claims
-                'reserved': total_reserved,   # Total reserved amount
-                'credits': total_reserved,    # User's credits at time of authorization
-                'authorized_until': float('inf')  # Unlimited time authorization
-            }
-
-            # Update cache with new state - FIXED: Show total usable credits in cache
-            credit_cache[username] = total_reserved  # Total usable credits (now all reserved)
+            # Cache credits for instant deduction
+            credit_cache[username] = current_credits
             credit_cache_last_update[username] = current_time
 
-            print(f"CONSOLIDATED 100%: {username} - ${available_credits} moved to reserved (total reserved: ${total_reserved})")
-            return user, total_reserved
+            # Track authorization (simplified - no pre-reservation)
+            user_authorizations[username] = {
+                'connection_time': current_time,
+                'available': current_credits,
+                'credits': current_credits,
+                'authorized_until': float('inf')
+            }
+
+            print(f"USER CONNECTED: {username} - ${current_credits} credits cached (no DB reservation)")
+            return user, current_credits
 
         except Exception as e:
             db.rollback()
@@ -3577,7 +3818,7 @@ async def _get_or_create_and_preauthorize_user_async(username: str) -> tuple[obj
         result = await loop.run_in_executor(None, sync_operation)
         return result
     except Exception as e:
-        print(f"CONSOLIDATED OPERATION FAILED for {username}: {e}")
+        print(f"USER CONNECTION FAILED for {username}: {e}")
         return None, 0.0
 
 def _preauthorize_user_credits(username: str) -> float:
@@ -3750,26 +3991,16 @@ async def _cleanup_user_authorization(username: str):
 
         total_reserved = auth_data.get('total_reserved', 0)
 
-        # RESOURCE SAFETY: Use context manager to ensure db.close() in all paths
+        # SIMPLIFIED: With single credits field, no cleanup needed on disconnect
+        # Credits remain in user's account, cache is simply cleared
         try:
-            with SessionLocal() as db:
-                user = db.query(User).filter(User.username == username).first()
-
-                if user and user.reserved_credits > 0:
-                    # Move reserved credits back to available credits
-                    reserved_amount = user.reserved_credits
-                    user.credits += reserved_amount      # Add back to available
-                    user.reserved_credits = Decimal('0.0')         # Clear reserved
-
-                    db.commit()
-
-                    # Update cache with new available credits
-                    credit_cache[username] = user.credits
-                    credit_cache_last_update[username] = time.time()
-
-                    print(f"RELEASED RESERVATION: {username} - ${reserved_amount} moved back to available credits")
-                else:
-                    print(f"DISCONNECT CLEANUP: {username} had $0 reserved credits to release")
+            # Just clear cache on disconnect
+            if username in credit_cache:
+                del credit_cache[username]
+            if username in credit_cache_last_update:
+                del credit_cache_last_update[username]
+            
+            print(f"DISCONNECT CLEANUP: {username} - cache cleared (credits remain in database)")
 
         except Exception as e:
             print(f"FAILED to release reserved credits for {username}: {e}")
@@ -4014,8 +4245,8 @@ async def _refresh_user_authorization_async(username: str):
                     if not user:
                         return None, 0.0
 
-                    # Calculate total available credits (available + reserved)
-                    total_credits = float(user.credits + user.reserved_credits)
+                    # Get user credits (simplified - no reserved_credits)
+                    total_credits = float(user.credits)
                     return user, total_credits
                 finally:
                     db.close()
@@ -5327,17 +5558,14 @@ ws_manager = WSManager()
 ring: List[Dict[str, Any]] = []
 seen: Set[str] = set()
 
-# Initialize keep-alive service - FIXED: Use localhost for internal health checks
-# This avoids SSL issues and uses internal endpoint
-INTERNAL_HEALTH_URL = f"http://localhost:{PORT}"
-keep_alive_service = KeepAliveService(INTERNAL_HEALTH_URL, KEEP_ALIVE_INTERVAL) if KEEP_ALIVE_ENABLED else None
+# Initialize keep-alive service - CRITICAL FIX: Use PRODUCTION_URL for external pings
+# Render only counts EXTERNAL requests to prevent sleep! localhost pings don't work!
+keep_alive_service = KeepAliveService(PRODUCTION_URL, KEEP_ALIVE_INTERVAL) if KEEP_ALIVE_ENABLED else None
 
-# Telegram Bot Setup
-api_id = 2040
-api_hash = "b18441a1ff607e10a989891a5462e627"  # official Telethon defaults
+# Telegram Bot Setup  # official Telethon defaults
 bot = None
 if TELEGRAM_BOT_TOKEN:
-    bot = TelegramClient("voucher-bot", api_id, api_hash)
+    bot = TelegramClient("voucher-bot", TG_API_ID, TG_API_HASH)
 
 def generate_code():
     """
@@ -5734,203 +5962,191 @@ async def telegram_keepalive(client):
             await asyncio.sleep(5)
 
 async def start_listener():
+    """
+    SIMPLIFIED: Try to connect to Telegram once at startup
+    - If successful, run until disconnected
+    - If it fails or disconnects, just exit (no retry)
+    - Web app continues to work without Telegram
+    """
     global telegram_connected
-    connection_attempt = 0
     keepalive_task = None
+    client = None
 
-    # INFINITE RETRY: Keep trying to reconnect forever
-    while True:
-        client = None
+    try:
+        print("Starting Telegram listener (single attempt)...")
+
+        # Try to connect with 30 second timeout
         try:
-            connection_attempt += 1
-            print(f"Starting Telegram listener (attempt {connection_attempt})...")
-
-            # Force fresh connection on retry attempts
-            force_reconnect = connection_attempt > 1
-
-            try:
-                client = await asyncio.wait_for(ensure_tg(force_reconnect=force_reconnect), timeout=30.0)
-                if not client:
-                    print("Failed to ensure Telegram client. Retrying in 3 seconds...")
-                    await asyncio.sleep(3)
-                    continue
-            except asyncio.TimeoutError:
-                print(f"TELEGRAM SETUP TIMEOUT (attempt {connection_attempt})")
-                print("Retrying with force reconnect in 3 seconds...")
-                await asyncio.sleep(3)
-                continue
-            except Exception as e:
-                error_msg = str(e).lower()
-                print(f"Connection error (attempt {connection_attempt}): {e}")
-
-                # Handle "already connected" or similar errors
-                if "already" in error_msg or "connect" in error_msg:
-                    print("Connection conflict detected - forcing fresh connection...")
-                    await force_disconnect_all()
-                    await asyncio.sleep(2)
-                    continue
-
-                print(f"Retrying in 3 seconds...")
-                await asyncio.sleep(3)
-                continue
-
-            # Successfully connected - proceed with setup
-            print(f"🎯 Current CHANNELS environment variable: '{CHANNELS}'")
-            print(f"🎯 CHANNELS type: {type(CHANNELS)}")
-            # Parse multiple channels from comma-separated string
-            channel_list = [ch.strip() for ch in CHANNELS.split(',') if ch.strip()]
-            print(f"📋 Parsed {len(channel_list)} channels: {channel_list}")
-            # Channel mapping for better tracking
-            channel_names = {}
-            # First, let's list available dialogs to help find the correct channels
-            print("🔍 Listing your available chats/channels:")
-            async for dialog in client.iter_dialogs():
-                print(f"  📱 {dialog.name} (ID: {dialog.id}, Username: {getattr(dialog.entity, 'username', 'None')})")
-            # Validate each channel and build list of valid channels
-            valid_channels = []
-            for i, channel in enumerate(channel_list):
-                try:
-                    print(f"🔍 [{i+1}/{len(channel_list)}] Attempting to get entity for: {channel}")
-                    entity = await client.get_entity(int(channel) if channel.lstrip('-').isdigit() else channel)
-                    channel_name = entity.title if hasattr(entity, 'title') else (entity.first_name or f"Channel_{entity.id}")
-                    channel_names[str(entity.id)] = channel_name
-                    print(f"[{i+1}] Successfully connected to: {channel_name} (ID: {entity.id})")
-                    # Convert to proper format for event listener
-                    channel_for_events = int(channel) if channel.lstrip('-').isdigit() else channel
-                    valid_channels.append(channel_for_events)
-                except Exception as e:
-                    print(f"[{i+1}] Could not access channel {channel}: {e}")
-                    print(f"   Make sure you're a member of this channel/chat")
-                    print("   Skipping this channel...")
-            if not valid_channels:
-                print("No valid channels found. Please check your CHANNELS environment variable")
+            client = await asyncio.wait_for(ensure_tg(force_reconnect=False), timeout=30.0)
+            if not client:
+                print("❌ Failed to ensure Telegram client - Telegram disabled")
+                print("✅ Web app will continue to work without Telegram")
                 return
-            print(f"🎯 Setting up event listener for {len(valid_channels)} channels: {valid_channels}")
-
-            # Define handler function (will be registered for THIS client only)
-            async def message_handler(ev):
-                # PRIORITY: Process message immediately without any delays
-                channel_name = channel_names.get(str(ev.chat_id), f"Unknown_{ev.chat_id}")
-                # ULTRA-FAST: Minimal logging for speed
-                print(f"INSTANT MESSAGE from {channel_name}")
-                # Get message text
-                text = (ev.message.message or "")
-                # Add caption if it exists (for media messages)
-                if hasattr(ev.message, 'caption') and ev.message.caption:
-                    text += "\n" + ev.message.caption
-                # ULTRA-FAST: Extract codes immediately
-                codes_with_values = extract_codes_with_values(text)
-                if codes_with_values:
-                    print(f"FOUND {len(codes_with_values)} codes")
-                if not codes_with_values:
-                    print("No valid codes found in message")
-                    return
-                ts = int(ev.message.date.timestamp() * 1000)
-                broadcast_count = 0
-                entries_to_broadcast = []
-
-                # Process all codes first
-                for item in codes_with_values:
-                    code = item["code"]
-                    value = item["value"]
-                    if code in seen:
-                        print(f"Warning: Code {code} already seen, skipping")
-                        continue
-                    seen.add(code)
-                    # Enhanced entry with more metadata
-                    entry = {
-                        "type": "code",
-                        "code": code,
-                        "ts": ts,
-                        "msg_id": ev.message.id,
-                        "channel": str(ev.chat_id),
-                        "channel_name": channel_name,
-                        "claim_base": CLAIM_URL_BASE,
-                        "priority": "instant",
-                        "telegram_ts": ts,
-                        "broadcast_ts": int(asyncio.get_event_loop().time() * 1000),
-                        "source": "telegram",
-                        "message_preview": text[:100],
-                        "username": "system"  # Default to system since no username yet
-                    }
-
-                    # Add value to entry if it exists
-                    if value:
-                        entry["value"] = value
-                    ring_add(entry)
-                    entries_to_broadcast.append(entry)
-                    broadcast_count += 1
-                    print(f"PREPARED #{broadcast_count}: {code}")
-
-                # Broadcast all codes simultaneously
-                if entries_to_broadcast:
-                    # Create all broadcast tasks at once for true simultaneous sending
-                    broadcast_tasks = [asyncio.create_task(ws_manager.broadcast(entry)) for entry in entries_to_broadcast]
-                    print(f"BROADCASTING {len(broadcast_tasks)} codes SIMULTANEOUSLY to all clients")
-                    # Optional: await all tasks to ensure they complete
-                    # await asyncio.gather(*broadcast_tasks, return_exceptions=True)
-
-            # Register handler explicitly (prevents duplication on reconnect)
-            client.add_event_handler(message_handler, events.NewMessage(chats=valid_channels))
-            print("Event handler registered for new messages")
-            
-            # Update global status
-            telegram_connected = True
-            print("🎉 Event listener setup complete! Ready to receive messages...")
-            print("Starting Telegram client and listening for messages...")
-            await client.start()
-            print("Telegram client started successfully!")
-            
-            # Start keepalive ping task to prevent idle disconnection
-            keepalive_task = asyncio.create_task(telegram_keepalive(client))
-            print("💓 Keepalive ping task started (45 second intervals)")
-            
-            try:
-                await client.run_until_disconnected()
-            finally:
-                # Always cleanup resources before reconnect
-                print("🧹 Cleaning up resources before reconnect...")
-                telegram_connected = False
-                
-                # Cancel keepalive task
-                if keepalive_task and not keepalive_task.done():
-                    keepalive_task.cancel()
-                    try:
-                        await keepalive_task
-                    except asyncio.CancelledError:
-                        pass
-                    print("Keepalive task cancelled")
-                
-                # Remove event handler to prevent duplication
-                if client and message_handler:
-                    try:
-                        client.remove_event_handler(message_handler)
-                        print("Event handler removed")
-                    except Exception as cleanup_err:
-                        print(f"Warning: Could not remove handler: {cleanup_err}")
-
-            # Connection dropped - prepare to reconnect
-            print("Warning: Telegram disconnected - connection lost")
-            print("Auto-reconnecting in 5 seconds...")
-            await asyncio.sleep(5 + random.random() * 2)  # Add jitter to prevent thundering herd
-            continue
-
+        except asyncio.TimeoutError:
+            print("❌ TELEGRAM SETUP TIMEOUT (30 seconds)")
+            print("✅ Web app will continue to work without Telegram")
+            return
         except Exception as e:
-            print(f"LISTENER ERROR: {e}")
-            print(f"Error type: {type(e).__name__}")
+            print(f"❌ Connection error: {e}")
+            print("✅ Web app will continue to work without Telegram")
+            return
+
+        # Successfully connected - proceed with setup
+        print(f"🎯 Current CHANNELS environment variable: '{CHANNELS}'")
+        print(f"🎯 CHANNELS type: {type(CHANNELS)}")
+        # Parse multiple channels from comma-separated string
+        channel_list = [ch.strip() for ch in CHANNELS.split(',') if ch.strip()]
+        print(f"📋 Parsed {len(channel_list)} channels: {channel_list}")
+        # Channel mapping for better tracking
+        channel_names = {}
+        # First, let's list available dialogs to help find the correct channels
+        print("🔍 Listing your available chats/channels:")
+        async for dialog in client.iter_dialogs():
+            print(f"  📱 {dialog.name} (ID: {dialog.id}, Username: {getattr(dialog.entity, 'username', 'None')})")
+        # Validate each channel and build list of valid channels
+        valid_channels = []
+        for i, channel in enumerate(channel_list):
+            try:
+                print(f"🔍 [{i+1}/{len(channel_list)}] Attempting to get entity for: {channel}")
+                entity = await client.get_entity(int(channel) if channel.lstrip('-').isdigit() else channel)
+                channel_name = entity.title if hasattr(entity, 'title') else (entity.first_name or f"Channel_{entity.id}")
+                channel_names[str(entity.id)] = channel_name
+                print(f"[{i+1}] Successfully connected to: {channel_name} (ID: {entity.id})")
+                # Convert to proper format for event listener
+                channel_for_events = int(channel) if channel.lstrip('-').isdigit() else channel
+                valid_channels.append(channel_for_events)
+            except Exception as e:
+                print(f"[{i+1}] Could not access channel {channel}: {e}")
+                print(f"   Make sure you're a member of this channel/chat")
+                print("   Skipping this channel...")
+        if not valid_channels:
+            print("❌ No valid channels found. Please check your CHANNELS environment variable")
+            print("✅ Web app will continue to work without Telegram")
+            return
+        print(f"🎯 Setting up event listener for {len(valid_channels)} channels: {valid_channels}")
+
+        # Define handler function (will be registered for THIS client only)
+        async def message_handler(ev):
+            # PRIORITY: Process message immediately without any delays
+            channel_name = channel_names.get(str(ev.chat_id), f"Unknown_{ev.chat_id}")
+            # ULTRA-FAST: Minimal logging for speed
+            print(f"INSTANT MESSAGE from {channel_name}")
+            # Get message text
+            text = (ev.message.message or "")
+            # Add caption if it exists (for media messages)
+            if hasattr(ev.message, 'caption') and ev.message.caption:
+                text += "\n" + ev.message.caption
+            # ULTRA-FAST: Extract codes immediately
+            codes_with_values = extract_codes_with_values(text)
+            if codes_with_values:
+                print(f"FOUND {len(codes_with_values)} codes")
+            if not codes_with_values:
+                print("No valid codes found in message")
+                return
+            ts = int(ev.message.date.timestamp() * 1000)
+            broadcast_count = 0
+            entries_to_broadcast = []
+
+            # Process all codes first
+            for item in codes_with_values:
+                code = item["code"]
+                value = item["value"]
+                if code in seen:
+                    print(f"Warning: Code {code} already seen, skipping")
+                    continue
+                seen.add(code)
+                # Enhanced entry with more metadata
+                entry = {
+                    "type": "code",
+                    "code": code,
+                    "ts": ts,
+                    "msg_id": ev.message.id,
+                    "channel": str(ev.chat_id),
+                    "channel_name": channel_name,
+                    "claim_base": CLAIM_URL_BASE,
+                    "priority": "instant",
+                    "telegram_ts": ts,
+                    "broadcast_ts": int(asyncio.get_event_loop().time() * 1000),
+                    "source": "telegram",
+                    "message_preview": text[:100],
+                    "username": "system"  # Default to system since no username yet
+                }
+
+                # Add value to entry if it exists
+                if value:
+                    entry["value"] = value
+                ring_add(entry)
+                entries_to_broadcast.append(entry)
+                broadcast_count += 1
+                print(f"PREPARED #{broadcast_count}: {code}")
+
+            # Broadcast all codes simultaneously
+            if entries_to_broadcast:
+                # Create all broadcast tasks at once for true simultaneous sending
+                broadcast_tasks = [asyncio.create_task(ws_manager.broadcast(entry)) for entry in entries_to_broadcast]
+                print(f"BROADCASTING {len(broadcast_tasks)} codes SIMULTANEOUSLY to all clients")
+                # Optional: await all tasks to ensure they complete
+                # await asyncio.gather(*broadcast_tasks, return_exceptions=True)
+
+        # Register handler explicitly (prevents duplication on reconnect)
+        client.add_event_handler(message_handler, events.NewMessage(chats=valid_channels))
+        print("Event handler registered for new messages")
+        
+        # Update global status
+        telegram_connected = True
+        print("🎉 Event listener setup complete! Ready to receive messages...")
+        print("Starting Telegram client and listening for messages...")
+        await client.start()
+        print("Telegram client started successfully!")
+        
+        # Start keepalive ping task to prevent idle disconnection
+        keepalive_task = asyncio.create_task(telegram_keepalive(client))
+        print("💓 Keepalive ping task started (45 second intervals)")
+        
+        try:
+            # Run until disconnected (no reconnect)
+            await client.run_until_disconnected()
+        finally:
+            # Always cleanup resources on exit
+            print("🧹 Cleaning up Telegram resources...")
             telegram_connected = False
             
-            # Cancel keepalive task on error
+            # Cancel keepalive task
             if keepalive_task and not keepalive_task.done():
                 keepalive_task.cancel()
                 try:
                     await keepalive_task
                 except asyncio.CancelledError:
                     pass
+                print("Keepalive task cancelled")
             
-            # Always retry after error with jitter
-            print(f"Retrying after error in 5 seconds...")
-            await asyncio.sleep(5 + random.random() * 2)  # Add jitter to prevent thundering herd
+            # Remove event handler to prevent duplication
+            if client and message_handler:
+                try:
+                    client.remove_event_handler(message_handler)
+                    print("Event handler removed")
+                except Exception as cleanup_err:
+                    print(f"Warning: Could not remove handler: {cleanup_err}")
+
+        # Connection dropped - just log and exit (no retry)
+        print("⚠️ Telegram disconnected - connection lost")
+        print("✅ Web app will continue to work without Telegram")
+
+    except Exception as e:
+        print(f"❌ TELEGRAM LISTENER ERROR: {e}")
+        print(f"Error type: {type(e).__name__}")
+        telegram_connected = False
+        
+        # Cancel keepalive task on error
+        if keepalive_task and not keepalive_task.done():
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Just log and exit (no retry)
+        print("✅ Web app will continue to work without Telegram")
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
@@ -5950,9 +6166,19 @@ async def api_root():
 
 @app.on_event("startup")
 async def startup_event():
-    # 🛡️ FIRST: Run crash recovery to release any stranded reserved credits
-    print("Running startup reconciliation for stranded reserved credits...")
-    startup_reconciliation()
+    # 🔥 CRITICAL: WAL crash recovery FIRST - replay unsynced credit deductions
+    print("=" * 60)
+    print("WAL CRASH RECOVERY - Replaying unsynced credit deductions...")
+    print("=" * 60)
+    await wal_crash_recovery()
+    
+    # Start WAL reconciliation worker (runs every 5 minutes)
+    print("Starting WAL reconciliation worker...")
+    asyncio.create_task(wal_reconciliation_check())
+    
+    # 🛡️ REMOVED: startup_reconciliation() no longer needed
+    # WAL crash recovery above already handles all credit deduction replays
+    print("Startup initialization complete - WAL crash recovery finished")
 
     # Enhanced database initialization with validation
     print("🗃️ Initializing database connection and tables...")
@@ -6063,8 +6289,17 @@ async def startup_event():
     else:
         print("ℹ️ Keep-alive service disabled")
 
-    # Start Telegram bot
-    if bot and TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID:
+    # Start Telegram bot - CRASH FIX: Validate credentials before starting
+    is_valid_bot_token = (
+        TELEGRAM_BOT_TOKEN and 
+        len(TELEGRAM_BOT_TOKEN) > 20 and  # Real bot tokens are much longer
+        ":" in TELEGRAM_BOT_TOKEN and
+        not TELEGRAM_BOT_TOKEN.startswith("dummy") and  # Reject dummy tokens
+        TELEGRAM_ADMIN_ID and 
+        TELEGRAM_ADMIN_ID > 10000  # Real admin IDs are larger
+    )
+    
+    if bot and is_valid_bot_token:
         print(f"🤖 Starting Telegram voucher bot...")
         print(f"Token: Admin ID: {TELEGRAM_ADMIN_ID}")
         async def run_bot():
@@ -6076,7 +6311,8 @@ async def startup_event():
                 print(f"Bot crashed: {e}")
         asyncio.create_task(run_bot())
     else:
-        print("ℹ️ Telegram bot disabled - set TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID to enable")
+        print("ℹ️ Telegram bot disabled - Invalid or dummy credentials detected")
+        print("   Set TELEGRAM_BOT_TOKEN (from @BotFather) and TELEGRAM_ADMIN_ID to enable")
 
     # Start background workers for cache and queue management
     print("Starting background workers for performance optimization...")
@@ -6107,8 +6343,9 @@ def _get_or_create_user(db: Session, username: str) -> User:
     return user
 
 @app.get("/healthz")
+@app.head("/healthz")
 async def health_check():
-    """Health check endpoint for load balancer and monitoring"""
+    """Health check endpoint for load balancer and monitoring - Supports both GET and HEAD"""
     import time
     return {"status": "healthy", "timestamp": int(time.time()), "version": "scalability-optimized"}
 
@@ -6142,32 +6379,24 @@ async def get_balance(request: Request, username: str, authenticated_user: str =
                 'expires': time.time() + USER_CREDIT_CACHE_TTL
             })
         
-        # SECURITY FIX: Sanitize cache values using safe_decimal to handle float/Decimal mix
-        # This prevents InvalidOperation errors when legacy floats exist in cache
+        # SIMPLIFIED: Use single credits field (no reserved_credits needed)
         credits = safe_decimal(user_data.get('credits', '0'), '0')
-        reserved_credits = safe_decimal(user_data.get('reserved_credits', '0'), '0')
         
-        # Write sanitized Decimals back to cache to eliminate legacy floats
+        # Write sanitized Decimals back to cache
         user_credit_cache[username] = {
             'credits': credits,
-            'reserved_credits': reserved_credits,
             'expires': user_data.get('expires', time.time() + USER_CREDIT_CACHE_TTL)
         }
 
-        # Show total usable credits (available + reserved)
-        # This ensures ok.js sees the correct balance and continues to receive codes
-        total_usable_credits = credits + reserved_credits
+        print(f"📊 CACHED BALANCE: {username} = ${credits:.4f}")
 
-        print(f"📊 CACHED BALANCE: {username} = ${credits:.4f} (${total_usable_credits:.4f} total)")
-
-        # Convert Decimal to float only for JSON response with proper quantization
-        # Wrapped in try/except to handle any remaining InvalidOperation errors
+        # Convert Decimal to float for JSON response
         try:
             return {
                 "username": username, 
-                "credits": float(total_usable_credits.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                "credits": float(credits.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
                 "available_credits": float(credits.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
-                "reserved_credits": float(reserved_credits.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
+                "reserved_credits": 0.0  # Always 0 with simplified system
             }
         except InvalidOperation as e:
             print(f"Warning: InvalidOperation in balance quantization for {username}: {e}")
@@ -6263,7 +6492,7 @@ async def redeem(request: Request, body: dict = Body(...), authenticated_user: s
                 "ok": True,
                 "redeemed": float(redeem_amount_decimal),
                 "remaining": remaining_value,
-                "credits": float(user_data['credits'] + user_data['reserved_credits']),
+                "credits": float(user_data['credits']),  # Simplified - no reserved_credits
                 "processing": "database_first_atomic"  # Indicate database-first processing
             }
 
@@ -6292,6 +6521,51 @@ async def voucher_info(request: Request, voucher_code: str, authenticated_user: 
         "code": voucher_code,
         "total_value": float(voucher_data['value']),
         "remaining_value": float(voucher_data['remaining_value'])
+    }
+
+@app.get("/wal-metrics")
+async def wal_metrics_endpoint(request: Request, authenticated_user: str = Depends(auth_context)):
+    """
+    WAL (Write-Ahead Log) Metrics Endpoint
+    Monitor credit deduction system health and performance
+    """
+    # Get pending deductions count from WAL database
+    with wal_db_lock:
+        with sqlite3.connect(WAL_DB_PATH) as conn:
+            pending = conn.execute("SELECT COUNT(*) FROM deductions WHERE synced = 0").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM deductions").fetchone()[0]
+            
+            recent_deductions = conn.execute("""
+                SELECT transaction_id, username, amount, code, synced, created_at 
+                FROM deductions 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """).fetchall()
+    
+    recent_list = []
+    for tx_id, username, amount, code, synced, created_at in recent_deductions:
+        recent_list.append({
+            'tx_id': tx_id[:8] + '...',
+            'username': username,
+            'amount': amount,
+            'code': code,
+            'synced': bool(synced),
+            'age_seconds': int(time.time() - created_at)
+        })
+    
+    return {
+        "status": "operational",
+        "metrics": wal_metrics,
+        "database": {
+            "total_deductions": total,
+            "pending_sync": pending,
+            "synced_percent": round((total - pending) / total * 100, 2) if total > 0 else 100
+        },
+        "recent_deductions": recent_list,
+        "cache_stats": {
+            "users_in_cache": len(credit_cache),
+            "last_updates": len(credit_cache_last_update)
+        }
     }
 
 # Escrow API Endpoints
@@ -6527,8 +6801,8 @@ async def verify_claim(request: Request, body: dict = Body(...), authenticated_u
 @app.post("/claim")
 async def claim_voucher_endpoint(
     request: Request,
-    code: str = Form(...),
-    username: str = Depends(auth_context)
+    username: str = Depends(auth_context),
+    code: str = Form(None),
 ):
     """MEMORY-FIRST: Instant credit deduction + CIRCUIT BREAKER + RACE CONDITION PROTECTION"""
     # CIRCUIT BREAKER: Check if system is overloaded before processing
@@ -6544,26 +6818,45 @@ async def claim_voucher_endpoint(
     # RACE CONDITION PROTECTION: Acquire per-user lock to prevent concurrent modifications
     async with per_user_locks[username]:
         try:
-            # Get claim data from request
-            form_data = await request.form()
-            amount = float(form_data.get('amount', 0))
-            currency = form_data.get('currency', 'usd')
-            success = form_data.get('success', 'false').lower() == 'true'
+            # FLEXIBLE INPUT: Accept both JSON and FormData formats
+            content_type = request.headers.get('content-type', '')
+            
+            if 'application/json' in content_type:
+                # JSON format from ok.js
+                json_data = await request.json()
+                code = json_data.get('code')
+                amount = float(json_data.get('amount', 0))
+                currency = json_data.get('currency', 'usd')
+                success = str(json_data.get('success', 'false')).lower() == 'true'
+            else:
+                # FormData format (legacy support)
+                form_data = await request.form()
+                code = code or form_data.get('code')  # From Form() param or form_data
+                amount = float(form_data.get('amount', 0))
+                currency = form_data.get('currency', 'usd')
+                success = form_data.get('success', 'false').lower() == 'true'
+            
+            # Validate required fields
+            if not code:
+                raise HTTPException(status_code=422, detail="Missing required field: code")
 
             # Update memory IMMEDIATELY if successful claim
-            fee_usd = 0
+            fee_usd = Decimal('0')  # FIXED: Use Decimal for all financial calculations
+            usd_amount = Decimal('0')  # Store USD amount for queue
             old_balance_snapshot = None  # For rollback on queue failure
             
             if success and amount > 0:
                 try:
-                    # Convert to USD for fee calculation
-                    usd_amount = float(await convert_to_usd(amount, currency))
-                    fee_usd = usd_amount * 0.05  # 5% fee in USD
+                    # FIXED: Keep as Decimal for precise financial calculations
+                    usd_amount = await convert_to_usd(Decimal(str(amount)), currency)
+                    fee_usd = usd_amount * Decimal('0.05')  # 5% fee in USD - Decimal arithmetic
                     
                     # INSTANT MEMORY UPDATE: Deduct from user's reserved credits (protected by lock)
                     if username in user_authorizations:
                         auth_data = user_authorizations[username]
-                        old_balance = auth_data.get('available', 0)
+                        
+                        # FIXED: Ensure old_balance is Decimal for comparison
+                        old_balance = Decimal(str(auth_data.get('available', 0)))
                         
                         # Check if user has enough credits (prevent negative balance)
                         if old_balance < fee_usd:
@@ -6571,8 +6864,8 @@ async def claim_voucher_endpoint(
                             return {
                                 'status': 'error',
                                 'message': 'Insufficient credits for claim fee',
-                                'required': fee_usd,
-                                'available': old_balance
+                                'required': float(fee_usd),
+                                'available': float(old_balance)
                             }
                         
                         # FINANCIAL SAFETY: Save balance snapshot for potential rollback
@@ -6581,16 +6874,17 @@ async def claim_voucher_endpoint(
                             'reserved': auth_data.get('reserved', 0)
                         }
                         
-                        # Deduct fee from memory (prevents user from receiving more codes if balance hits 0)
-                        auth_data['available'] = max(0, auth_data['available'] - fee_usd)
-                        auth_data['reserved'] = max(0, auth_data['reserved'] - fee_usd)
+                        # FIXED: Deduct fee from memory using Decimal arithmetic (Decimal - Decimal)
+                        auth_data['available'] = max(Decimal('0'), Decimal(str(auth_data['available'])) - fee_usd)
+                        auth_data['reserved'] = max(Decimal('0'), Decimal(str(auth_data['reserved'])) - fee_usd)
                         
                         # Invalidate persistent cache to force refresh
                         if username in persistent_auth_cache:
                             del persistent_auth_cache[username]
                         
                         new_balance = auth_data['available']
-                        print(f"💳 INSTANT DEDUCTION: {username} ${old_balance:.4f} → ${new_balance:.4f} (fee: ${fee_usd:.4f})")
+                        # FIXED: Format Decimal values for display
+                        print(f"💳 INSTANT DEDUCTION: {username} ${float(old_balance):.4f} → ${float(new_balance):.4f} (fee: ${float(fee_usd):.4f})")
                         
                         # If balance hits 0, user will stop receiving codes immediately
                         if new_balance <= 0:
@@ -6601,7 +6895,8 @@ async def claim_voucher_endpoint(
 
             # FINANCIAL SAFETY: Add to queue with compensating transaction on failure
             try:
-                await add_claim_to_queue(username, code, amount, currency, success)
+                # CRITICAL FIX: Pass USD amount to queue for correct fee calculation in batch
+                await add_claim_to_queue(username, code, amount, currency, success, usd_amount)
             except HTTPException as queue_error:
                 # COMPENSATING TRANSACTION: Restore credits if queue add failed
                 if old_balance_snapshot and username in user_authorizations:
@@ -6613,10 +6908,17 @@ async def claim_voucher_endpoint(
                 # Re-raise the queue overflow error to client
                 raise queue_error
 
+            # Get updated balance for response
+            current_credits = Decimal('0')
+            if username in user_authorizations:
+                current_credits = Decimal(str(user_authorizations[username].get('available', 0)))
+            
             return {
+                'success': success,  # Add success field for ok.js compatibility
                 'status': 'queued',
                 'message': 'Claim processed instantly in memory, database sync queued',
-                'fee_charged': fee_usd,
+                'fee_charged': float(fee_usd),  # FIXED: Convert Decimal to float for JSON response
+                'credits': float(current_credits),  # Add updated credits for ok.js to update display
                 'memory_updated': success
             }
         except Exception as e:
@@ -6643,8 +6945,9 @@ async def health():
     return PlainTextResponse("Service Temporarily Unavailable", 503)
 
 @app.get("/internal/health")
+@app.head("/internal/health")
 async def internal_health():
-    """INTERNAL: Real health check for keep-alive service - ULTRA FAST (no DB queries)"""
+    """INTERNAL: Real health check for keep-alive service - ULTRA FAST (no DB queries) - Supports GET and HEAD"""
     # TIMEOUT FIX: No database queries - instant response to prevent cron timeout
     # Database queries can take 10-20+ seconds during cold start, causing 30s cron timeout
     status = {
